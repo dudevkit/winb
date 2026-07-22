@@ -1,0 +1,10 @@
+node_modules/
+server.log
+*.log
+progress.json
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.tmp
