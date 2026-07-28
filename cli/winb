@@ -1,14 +1,25 @@
 #!/bin/bash
 
-SERVER_URL="http://192.168.1.100:5110"
+# Target winb-server on Windows. Override with env:
+#   WINB_HOST / WINB_PORT  or full  WINB_URL
+WINB_HOST="${WINB_HOST:-100.122.74.12}"
+WINB_PORT="${WINB_PORT:-5110}"
+SERVER_URL="${WINB_URL:-http://${WINB_HOST}:${WINB_PORT}}"
+# Userspace Tailscale on this server: route via local SOCKS unless WINB_NOPROXY=1
+if [[ -z "${WINB_NOPROXY:-}" ]]; then
+  if [[ -z "${ALL_PROXY:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
+    export ALL_PROXY="${WINB_SOCKS:-socks5h://127.0.0.1:1055}"
+  fi
+fi
 
 show_help() {
     echo "Usage: winb [OPTIONS] \"command\""
     echo "Executes a command on the remote Windows PC via winb-server."
+    echo "Server: $SERVER_URL  (set WINB_HOST/WINB_PORT or WINB_URL)"
     echo ""
     echo "Options:"
     echo "  -h, --help               Show this help message"
-    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. \"F:\AliceWorkspace\")"
+    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. \"F:\\AliceWorkspace\")"
     echo "  -b, --background         Run command in background (returns immediately)"
     echo "  -id, --process-id <id>   Custom process ID for background task (optional, pairs with -b)"
     echo "  -l, --list               List active/background process records"
@@ -23,10 +34,11 @@ show_help() {
     echo "  -t, --timeout <sec>      Timeout in seconds (for foreground tasks)"
     echo ""
     echo "Examples:"
-    echo "  winb -w \"F:\\AliceWorkspace\" \"npm run dev\""
+    echo "  export WINB_HOST=192.168.1.100 WINB_PORT=5110"
+    echo "  winb --health"
+    echo "  winb -w \"F:\\\\AliceWorkspace\" \"npm run dev\""
     echo "  winb -b -id server1 \"python app.py\""
     echo "  winb -l"
-    echo "  winb --health"
     echo "  winb --open-url http://localhost:3000"
     echo "  winb --port 3000"
     echo "  winb --logs server1 --tail 50"
@@ -124,7 +136,7 @@ done
 # Handle KILL action
 if [[ -n "$KILL_ID" ]]; then
     PAYLOAD=$(jq -n --arg pid "$KILL_ID" '{processId: $pid}')
-    curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/kill"
+    curl -s --connect-timeout 5 --max-time 30 -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/kill"
     echo ""
     exit 0
 fi
@@ -132,7 +144,7 @@ fi
 # Handle OPEN URL action
 if [[ -n "$OPEN_URL" ]]; then
     PAYLOAD=$(jq -n --arg url "$OPEN_URL" '{url: $url}')
-    RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/open-url")
+    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/open-url")
     if [[ $? -ne 0 ]]; then
         echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
         exit 1
@@ -148,7 +160,7 @@ fi
 
 # Handle PORT CHECK action
 if [[ -n "$PORT_CHECK" ]]; then
-    RESPONSE=$(curl -s "$SERVER_URL/port/$PORT_CHECK")
+    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/port/$PORT_CHECK")
     if [[ $? -ne 0 ]]; then
         echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
         exit 1
@@ -168,7 +180,7 @@ fi
 
 # Handle LIST action
 if [[ "$LIST" == "true" ]]; then
-    RESPONSE=$(curl -s "$SERVER_URL/list")
+    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/list")
     if [[ $? -ne 0 ]]; then
         echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
         exit 1
@@ -179,7 +191,7 @@ fi
 
 # Handle HEALTH action
 if [[ "$HEALTH" == "true" ]]; then
-    RESPONSE=$(curl -s "$SERVER_URL/health")
+    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/health")
     if [[ $? -ne 0 ]]; then
         echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
         exit 1
@@ -202,7 +214,7 @@ fi
 
 # Handle LOGS action
 if [[ -n "$LOGS_ID" ]]; then
-    RESPONSE=$(curl -s "$SERVER_URL/logs/$LOGS_ID?tail=$TAIL")
+    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/logs/$LOGS_ID?tail=$TAIL")
     if [[ $? -ne 0 ]]; then
         echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
         exit 1
@@ -267,12 +279,11 @@ PAYLOAD=$(jq -n \
         env: $env
     }')
 
-# Execute request
-RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/run")
-
-# Check if curl failed
-if [[ $? -ne 0 ]]; then
-    echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
+# Execute request (curl -f would hide body; keep -s and check exit + empty)
+RESPONSE=$(curl -s --connect-timeout 5 --max-time "${CURL_MAX_TIME:-120}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/run")
+CURL_RC=$?
+if [[ $CURL_RC -ne 0 ]]; then
+    echo "Error: Could not connect to winb-server at $SERVER_URL (curl exit $CURL_RC)" >&2
     exit 1
 fi
 
@@ -301,3 +312,4 @@ else
     
     exit ${EXIT_CODE:-0}
 fi
+
