@@ -1,10 +1,11 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Folder ini = folder tempat script berada (Desktop\winb-server)
+# Folder = directory containing this script (e.g. Desktop\winb-server)
 $workDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $workDir
 $logFile = Join-Path $workDir "server.log"
+$script:proc = $null
 
 function Write-LogSep([string]$msg) {
     Add-Content -Path $logFile -Value "============================================"
@@ -22,11 +23,21 @@ function Start-WinbNode {
     return [System.Diagnostics.Process]::Start($procInfo)
 }
 
-# Cek node
+function Stop-WinbTree {
+    # Kill only the WinB-spawned cmd wrapper + its child tree (not every node.exe on the machine)
+    if ($script:proc -and -not $script:proc.HasExited) {
+        $pidToKill = $script:proc.Id
+        Start-Process -FilePath "taskkill.exe" -ArgumentList "/PID",$pidToKill,"/T","/F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+        try { Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    $script:proc = $null
+}
+
+# Check Node
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
     [System.Windows.Forms.MessageBox]::Show(
-        "Node.js belum terpasang.`nInstall dulu dari https://nodejs.org (LTS), lalu jalankan INSTALL-SEKALI.bat lagi.",
+        "Node.js is not installed.`nInstall LTS from https://nodejs.org, then run INSTALL-SEKALI.bat again.",
         "WinB - Node.js missing",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -34,19 +45,30 @@ if (-not $node) {
     exit 1
 }
 
-# Cek dependencies
+# Check dependencies
 if (-not (Test-Path (Join-Path $workDir "node_modules"))) {
     [System.Windows.Forms.MessageBox]::Show(
-        "Folder node_modules belum ada.`nJalankan dulu INSTALL-SEKALI.bat (double-click).",
-        "WinB - Belum di-install",
+        "node_modules is missing.`nRun INSTALL-SEKALI.bat first (double-click).",
+        "WinB - Not installed yet",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Warning
     )
     exit 1
 }
 
-Write-LogSep "Winb Server Started at $(Get-Date)  dir=$workDir"
-$proc = Start-WinbNode
+# If server already answering on 5110, do not start a second Node (avoid EADDRINUSE / dual tray chaos)
+$alreadyUp = $false
+try {
+    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:5110/ping" -UseBasicParsing -TimeoutSec 2
+    if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) { $alreadyUp = $true }
+} catch { $alreadyUp = $false }
+
+if ($alreadyUp) {
+    Write-LogSep "WinB tray attached; server already up on :5110 at $(Get-Date) dir=$workDir"
+} else {
+    Write-LogSep "Winb Server Started at $(Get-Date)  dir=$workDir"
+    $script:proc = Start-WinbNode
+}
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-Process -Id $PID).Path)
@@ -66,28 +88,31 @@ $menuRestart = New-Object System.Windows.Forms.MenuItem
 $menuRestart.Text = "Restart Server (Hard)"
 $menuRestart.add_Click({
     $result = [System.Windows.Forms.MessageBox]::Show(
-        "Restart WinB Server?`n`nWARNING: background jobs managed by WinB will be killed.",
+        "Restart WinB Server?`n`nWARNING: background jobs managed by this WinB instance will be killed.",
         "Confirm Restart",
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Warning
     )
     if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        Stop-Process -Name "node" -Force -ErrorAction SilentlyContinue
-        if ($proc -and -not $proc.HasExited) {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        }
+        Stop-WinbTree
+        # Also free port 5110 if a stray node from a previous tray still holds it
+        try {
+            $conns = Get-NetTCPConnection -LocalPort 5110 -State Listen -ErrorAction SilentlyContinue
+            foreach ($c in $conns) {
+                if ($c.OwningProcess) {
+                    Start-Process -FilePath "taskkill.exe" -ArgumentList "/PID",$c.OwningProcess,"/T","/F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+        } catch {}
         Write-LogSep "Winb Server (HARD RESTART) at $(Get-Date)"
-        $proc = Start-WinbNode
+        $script:proc = Start-WinbNode
     }
 })
 
 $menuExit = New-Object System.Windows.Forms.MenuItem
 $menuExit.Text = "Exit WinB Server"
 $menuExit.add_Click({
-    Stop-Process -Name "node" -Force -ErrorAction SilentlyContinue
-    if ($proc -and -not $proc.HasExited) {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    }
+    Stop-WinbTree
     $notifyIcon.Visible = $false
     [System.Windows.Forms.Application]::Exit()
 })
@@ -104,7 +129,9 @@ $notifyIcon.add_DoubleClick({
 })
 
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($script:proc -and -not $script:proc.HasExited) {
+        Start-Process -FilePath "taskkill.exe" -ArgumentList "/PID",$script:proc.Id,"/T","/F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+    }
 } | Out-Null
 
 [System.Windows.Forms.Application]::Run()

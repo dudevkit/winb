@@ -1,14 +1,18 @@
 #!/bin/bash
 
-# Target winb-server on Windows. Override with env:
+# Target winb-server on Windows. Override with env (portable defaults — no host-specific IPs):
 #   WINB_HOST / WINB_PORT  or full  WINB_URL
-WINB_HOST="${WINB_HOST:-100.122.74.12}"
+# Optional proxy (only if YOU set it — e.g. userspace Tailscale SOCKS on a gateway):
+#   WINB_SOCKS=socks5h://127.0.0.1:1055
+#   or ALL_PROXY / HTTP_PROXY / http_proxy
+# WINB_NOPROXY=1 forces direct (clears using WINB_SOCKS only; does not unset caller proxies)
+WINB_HOST="${WINB_HOST:-192.168.1.100}"
 WINB_PORT="${WINB_PORT:-5110}"
 SERVER_URL="${WINB_URL:-http://${WINB_HOST}:${WINB_PORT}}"
-# Userspace Tailscale on this server: route via local SOCKS unless WINB_NOPROXY=1
-if [[ -z "${WINB_NOPROXY:-}" ]]; then
+if [[ -n "${WINB_SOCKS:-}" && -z "${WINB_NOPROXY:-}" ]]; then
+  # Opt-in only: do not invent a default SOCKS for every clone
   if [[ -z "${ALL_PROXY:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
-    export ALL_PROXY="${WINB_SOCKS:-socks5h://127.0.0.1:1055}"
+    export ALL_PROXY="${WINB_SOCKS}"
   fi
 fi
 
@@ -17,9 +21,16 @@ show_help() {
     echo "Executes a command on the remote Windows PC via winb-server."
     echo "Server: $SERVER_URL  (set WINB_HOST/WINB_PORT or WINB_URL)"
     echo ""
+    echo "Env:"
+    echo "  WINB_HOST   Windows host (default: 192.168.1.100)"
+    echo "  WINB_PORT   Port (default: 5110)"
+    echo "  WINB_URL    Full base URL (overrides host/port)"
+    echo "  WINB_SOCKS  Optional SOCKS/HTTP proxy URL for curl (opt-in only)"
+    echo "  WINB_NOPROXY=1  Do not apply WINB_SOCKS"
+    echo ""
     echo "Options:"
     echo "  -h, --help               Show this help message"
-    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. \"F:\\AliceWorkspace\")"
+    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. F:/AliceWorkspace)"
     echo "  -b, --background         Run command in background (returns immediately)"
     echo "  -id, --process-id <id>   Custom process ID for background task (optional, pairs with -b)"
     echo "  -l, --list               List active/background process records"
@@ -36,16 +47,18 @@ show_help() {
     echo "Examples:"
     echo "  export WINB_HOST=192.168.1.100 WINB_PORT=5110"
     echo "  winb --health"
-    echo "  winb -w \"F:\\\\AliceWorkspace\" \"npm run dev\""
-    echo "  winb -b -id server1 \"python app.py\""
+    echo "  winb -w 'F:/AliceWorkspace/my-app' 'npm run dev'"
+    echo "  winb -b -id server1 'python app.py'"
     echo "  winb -l"
     echo "  winb --open-url http://localhost:3000"
     echo "  winb --port 3000"
     echo "  winb --logs server1 --tail 50"
-    echo "  winb -e PORT=3001 -e NODE_ENV=development \"npm run dev\""
+    echo "  winb -e PORT=3001 -e NODE_ENV=development 'npm run dev'"
     echo "  winb -k server1"
     echo "  winb -p \"Get-Process | Where-Object Name -eq 'node'\""
-    echo "  winb -t 10 \"ping 8.8.8.8\""
+    echo "  winb -t 10 'ping 8.8.8.8'"
+    echo "  # Userspace Tailscale gateway (opt-in):"
+    echo "  export WINB_HOST=100.x.x.x WINB_SOCKS=socks5h://127.0.0.1:1055"
 }
 
 COMMAND=""
@@ -312,4 +325,3 @@ else
     
     exit ${EXIT_CODE:-0}
 fi
-
