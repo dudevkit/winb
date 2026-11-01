@@ -33,6 +33,7 @@ docs/
   winb-execution.md                   # operating the bridge from a gateway (mount, paths, elevation, traps)
   windows-remote-execution-bridge.md  # the hybrid layout: SMB mount + HTTP execution, tray autostart
   AUDIT-2026-11-01.md                 # usage audit + acceptance list for the v1.3 work
+  winb-v1.4-spec.md                   # v1.4 proposal: host state, event timeline, app usage (draft)
 ```
 
 ## Features

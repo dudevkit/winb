@@ -13,5 +13,6 @@ Thumbs.db
 .token
 sessions.json
 jobs.json
+history/
 *.bak
 node_modules/
