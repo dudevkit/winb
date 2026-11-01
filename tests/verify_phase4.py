@@ -7,16 +7,19 @@ Requires a live server v1.4+ on the Windows host:
     export WINB_TOKEN_FILE=~/.winb-token
     python3 tests/verify_phase4.py
 
-Checks 1-18 cover: private-endpoint auth, the /state contract, sampler health, timeline
-integrity, cursor semantics, retention accounting, and the promise that window titles do
-not reach the disk when WINB_TITLES_PERSIST is off.
+Checks 1-19 cover: private-endpoint auth, the /state contract, sampler health, timeline
+integrity, cursor semantics, retention accounting, the promise that window titles do
+not reach the disk when WINB_TITLES_PERSIST is off, and that restarting the server does
+not re-append event-log rows history already contains.
 
 Non-destructive by default: the purge check keeps the retention window. Set
 WINB_TEST_PURGE=1 to also run the full wipe (days=0) which empties the timeline.
 """
 
+import collections
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -229,6 +232,68 @@ start = time.time()
 get_json("/timeline?hours=24&limit=200")
 timeline_ms = (time.time() - start) * 1000
 check("18 latency", state_ms < 1500 and timeline_ms < 4000, f"/state {state_ms:.0f} ms, /timeline {timeline_ms:.0f} ms")
+
+# 19 - a restart must not duplicate history. The first sweep reads 168 h, so the dedupe seed has
+# to cover the same window; otherwise every restart re-appends 4-to-7-day-old events as fresh rows.
+def _history_local():
+    """Readable view of the history dir. The gateway usually sees it through the SMB share."""
+    win = (tracking.get("historyDir") or "").replace("\\", "/")
+    local = pathlib.Path(win) if os.path.isabs(win) else None
+    if local and local.is_dir():
+        return local
+    parts = win.split("/")
+    # F:/AliceWorkspace/winb-server/history -> //host/AliceWorkspace is mounted locally; match on
+    # the tail so the test also works when the share name differs from the folder name.
+    for mount in sorted(pathlib.Path("/mnt").glob("*")):
+        tail = parts[2:] if len(parts) > 2 else parts
+        cand = mount.joinpath(*tail[1:]) if len(tail) > 1 else mount
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def event_snapshot(hist_dir):
+    keys = collections.Counter()
+    total = 0
+    for f in sorted(hist_dir.glob("state-*.jsonl")):
+        for line in f.read_text("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("src") != "eventlog":
+                continue
+            total += 1
+            data = row.get("data") or {}
+            keys["|".join(str(data.get(k)) for k in ("log", "id", "at"))] += 1
+    return total, sum(v - 1 for v in keys.values() if v > 1)
+
+
+hist_dir = _history_local()
+before_pid = (get_json("/health")[1]).get("pid")
+if hist_dir is None:
+    check("19 restart does not duplicate history events", True,
+          "skipped: history dir not readable from this host (no share mounted)")
+else:
+    before_events, before_dups = event_snapshot(hist_dir)
+    restart_code, _ = winb(["-p", "Stop-Process -Id (Get-NetTCPConnection -LocalPort 5110 "
+                                  "-State Listen).OwningProcess -Force; 'restarting'"])
+    new_pid = None
+    for _ in range(60):
+        time.sleep(1)
+        st, body = get_json("/health")
+        if st == 200 and body.get("pid") and body.get("pid") != before_pid:
+            new_pid = body.get("pid")
+            break
+    time.sleep(int((tracking.get("sampleSec") or 60)) + 3)
+    after_events, after_dups = event_snapshot(hist_dir)
+    check("19 restart does not duplicate history events",
+          restart_code == 0 and new_pid is not None and before_dups == 0 and after_dups == 0
+          and after_events >= before_events,
+          f"pid {before_pid} -> {new_pid}, events {before_events} -> {after_events}, "
+          f"dups {before_dups} -> {after_dups}")
 
 failed = [r for r in RESULTS if not r[1]]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")

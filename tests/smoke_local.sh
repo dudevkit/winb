@@ -131,6 +131,11 @@ check "33 /events/since advances cursor" '"count"'             "$(api GET "/even
 check "34 history file written"          'state-'             "$(ls "$ROOT/history" 2>/dev/null)"
 check "35 sampler logged its start"      'sampler.state'      "$(api GET '/timeline?hours=1&kinds=sampler.state')"
 
+# A restart must not re-append event-log rows that history already holds: the dedupe seed has to
+# cover the whole 168 h sweep window, not just the newest few daily files.
+check "36 restart does not re-append events" '[PASS]' \
+    "$(WINB_TEST_SERVER_DIR="$SRV" node "$HERE/tests/test_event_dedupe.js" 2>&1)"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]] || exit 1

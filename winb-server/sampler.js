@@ -473,9 +473,13 @@ class Sampler {
     }
 
     _seedFromDisk(cfg) {
-        const files = this._files();
-        const recent = files.slice(-3);
-        for (const file of recent) {
+        // Seed the dedupe set over the same window the first sweep reads (168 h), not just the
+        // newest few files: an event 4-to-7 days old lives in an earlier file, so seeding only the
+        // last three made every restart re-append it and /timeline showed it as a fresh row.
+        const days = Number.isFinite(Number(cfg && cfg.historyDays)) ? Number(cfg.historyDays) : 0;
+        const cutoff = days > 0 ? dayKey(new Date(Date.now() - days * 86400000)) : null;
+        const files = this._files().filter((file) => !cutoff || file.key >= cutoff);
+        for (const file of files) {
             for (const row of this._readEvents(file)) {
                 if (row.kind === 'power.boot' && row.data && row.data.bootTime) this.prevBoot = row.data.bootTime;
                 if (row.kind === 'app.switch' && row.data && row.data.app && row.data.title) {
@@ -486,6 +490,10 @@ class Sampler {
                     this.seenEvents.add(`${row.data.log}|${row.data.id}|${row.data.at}`);
                 }
             }
+        }
+        if (this.titleRing.length > TITLE_RING_MAX) this.titleRing.splice(0, this.titleRing.length - TITLE_RING_MAX);
+        if (this.seenEvents.size > SEEN_MAX) {
+            this.seenEvents = new Set(Array.from(this.seenEvents).slice(-Math.floor(SEEN_MAX / 2)));
         }
         if (!this.prevBoot) this.prevBoot = cfg && cfg.history ? this._bootFromDisk(cfg) : null;
         return this.prevBoot;
