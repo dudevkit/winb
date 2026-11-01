@@ -24,6 +24,7 @@ cli/
   winb-office         # thin wrapper: loopback bridge profile, no --admin
   legacy/winb-v1.sh   # the retired bash+jq client, kept for reference only
 tests/
+  smoke_local.sh      # 21 checks, boots the server locally (no Windows host needed)
   verify_client.py    # 17 client behaviour checks
   verify_phase2.py    # 13 server-hardening checks
   verify_phase3.py    # 12 typed-op / session checks
@@ -147,6 +148,14 @@ python3 tests/verify_phase3.py      # 12 checks
 ```
 
 Each suite prints `PASS`/`FAIL` per check and exits non-zero on failure. Run all three after touching `server.js`, `api.js` or `cli/winb`.
+
+No Windows host at hand? `tests/smoke_local.sh` boots the server pair on a temp port against a temp root and drives the OS-agnostic surface (auth, `/health`, `/manifest`, `fs.*`, sessions, `/reload`) — 21 checks, no Windows required:
+
+```bash
+tests/smoke_local.sh                 # needs node + npm + curl
+```
+
+Exec paths (`cmd.exe`, PowerShell) are out of its scope by design.
 
 ## Security notes
 
