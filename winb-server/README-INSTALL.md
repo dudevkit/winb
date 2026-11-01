@@ -14,15 +14,15 @@ Diagnostics: double-click **`CEK-STATUS.bat`** and share the output.
 
 ## What changed vs hard-coded Alice paths
 
-- `winb-tray.ps1`, `start-winb.vbs`, `tail-log.ps1` resolve paths from the script directory (no fixed `F:\AliceWorkspace\...`).
+- `winb-tray.ps1`, `start-winb.vbs`, `tail-log.ps1` resolve paths from the script directory (no hardcoded drive or folder).
 - Install/start bats wait for user input so errors are visible; they refuse a second start if `:5110` is already up.
 - Tray restart/exit kills only the WinB process tree (`taskkill /T`), not every `node.exe` on the PC.
-- Linux CLI (`cli/winb`) uses portable defaults (`WINB_HOST=192.168.1.100`). Optional `WINB_SOCKS` is **opt-in** for userspace Tailscale gateways — never auto-set in the published script.
+- Linux CLI (`cli/winb`) uses portable defaults (`WINB_HOST=<host-ip>`). Optional `WINB_SOCKS` is **opt-in** for userspace Tailscale gateways — never auto-set in the published script.
 
 ## Gateway env examples
 
 ```bash
-export WINB_HOST=192.168.1.100
+export WINB_HOST=<host-ip>
 export WINB_PORT=5110
 # Tailscale userspace SOCKS (only if your gateway needs it):
 # export WINB_SOCKS=socks5h://127.0.0.1:1055

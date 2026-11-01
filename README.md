@@ -29,9 +29,10 @@ tests/
   verify_phase2.py    # 13 server-hardening checks
   verify_phase3.py    # 12 typed-op / session checks
 docs/
-  winb-v1.3.md        # v1.3 reference: endpoints, flags, HMR, recovery, pitfalls
-  winb-execution.md   # operating the bridge from a gateway (skills, SSH fallbacks)
-  AUDIT-2026-11-01.md # usage audit + acceptance list for the v1.3 work
+  winb-v1.3.md                        # v1.3 reference: endpoints, flags, HMR, recovery, pitfalls
+  winb-execution.md                   # operating the bridge from a gateway (mount, paths, elevation, traps)
+  windows-remote-execution-bridge.md  # the hybrid layout: SMB mount + HTTP execution, tray autostart
+  AUDIT-2026-11-01.md                 # usage audit + acceptance list for the v1.3 work
 ```
 
 ## Features
@@ -86,7 +87,7 @@ With no `.token` file and no `WINB_TOKEN`, the server runs **open** (fail-open) 
 ## Quick start (Linux CLI)
 
 ```bash
-export WINB_HOST=192.168.1.100      # or WINB_URL=http://host:5110
+export WINB_HOST=<host-ip>           # or WINB_URL=http://host:5110
 export WINB_PORT=5110
 
 # optional: userspace SOCKS proxy (opt-in only)
@@ -140,7 +141,7 @@ Full request/response shapes: [docs/winb-v1.3.md](docs/winb-v1.3.md).
 Acceptance suites run **against a live server** (they exercise the real bridge, not mocks). Point them at it the same way the CLI is pointed:
 
 ```bash
-export WINB_HOST=192.168.1.100      # or WINB_URL=...
+export WINB_HOST=<host-ip>           # or WINB_URL=...
 export WINB_TOKEN_FILE=~/.winb-token
 python3 tests/verify_client.py      # 17 checks
 python3 tests/verify_phase2.py      # 13 checks

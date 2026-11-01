@@ -119,9 +119,10 @@ Environment
   WINB_SOCKS                       proxy for the transport, e.g. socks5h://127.0.0.1:1055
   WINB_DEFAULT_CWD                 remote working directory for file verbs
   WINB_SSH_TARGET / WINB_SSH_KEY   enable --admin (user@host + private key)
+  WINB_SHARE_MOUNT                 local mount of the host's SMB share, for `doctor`
 
 Examples
-  export WINB_HOST=192.168.1.100
+  export WINB_HOST=<host-ip>
   winb "echo hi"
   winb -p "Get-Content C:\\logs\\app.log -Tail 20"
   winb put ./fix.py "C:\\Temp\\fix.py" && winb -p "python C:\\Temp\\fix.py"
@@ -768,13 +769,17 @@ def cmd_doctor(server=None):
                                    or run_remote("python -V", server=server).get("stderr") or "").strip())
     probe("node on PC", lambda: run_remote("node --version", server=server)["stdout"].strip())
     probe("git on PC", lambda: run_remote("git --version", server=server)["stdout"].strip())
-    probe("free space C:", lambda: run_remote("(Get-PSDrive C).Free", powershell=True,
-                                              server=server)["stdout"].strip())
-    probe("free space F:", lambda: run_remote("(Get-PSDrive F).Free", powershell=True,
-                                              server=server)["stdout"].strip())
-    probe("smb mount local", lambda: subprocess.run(
-        ["findmnt", "-no", "OPTIONS", "/mnt/alice-workspace"], capture_output=True,
-        text=True).stdout.strip() or "NOT MOUNTED")
+    probe("drives", lambda: " | ".join(
+        f"{d['name']} {d.get('freeGB', '?')}G free"
+        for d in json.loads(request("GET", "/manifest", timeout=30, server=server,
+                                    retries=1)[1]).get("drives", [])) or "none reported")
+    # Set WINB_SHARE_MOUNT to the path where this gateway mounts the host's share; the
+    # transport report is skipped when it is unset (the mount is optional by design).
+    if os.environ.get("WINB_SHARE_MOUNT"):
+        mount = os.environ["WINB_SHARE_MOUNT"]
+        probe("share mount", lambda: subprocess.run(
+            ["findmnt", "-no", "OPTIONS", mount], capture_output=True,
+            text=True).stdout.strip() or f"NOT MOUNTED ({mount})")
     probe("client", lambda: f"winb v2 python {sys.version.split()[0]}")
 
     width = max(len(r[0]) for r in rows)

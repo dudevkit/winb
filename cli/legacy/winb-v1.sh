@@ -1,12 +1,15 @@
 #!/bin/bash
 
+# Retired v1 client, kept for reference: it predates bearer-token auth, so a v1.3 server
+# answers 401 to every non-loopback call from it. Use `cli/winb` (v2) for real work.
+#
 # Target winb-server on Windows. Override with env (portable defaults — no host-specific IPs):
 #   WINB_HOST / WINB_PORT  or full  WINB_URL
 # Optional proxy (only if YOU set it — e.g. userspace Tailscale SOCKS on a gateway):
 #   WINB_SOCKS=socks5h://127.0.0.1:1055
 #   or ALL_PROXY / HTTP_PROXY / http_proxy
 # WINB_NOPROXY=1 forces direct (clears using WINB_SOCKS only; does not unset caller proxies)
-WINB_HOST="${WINB_HOST:-192.168.1.100}"
+WINB_HOST="${WINB_HOST:-127.0.0.1}"
 WINB_PORT="${WINB_PORT:-5110}"
 SERVER_URL="${WINB_URL:-http://${WINB_HOST}:${WINB_PORT}}"
 if [[ -n "${WINB_SOCKS:-}" && -z "${WINB_NOPROXY:-}" ]]; then
@@ -22,7 +25,7 @@ show_help() {
     echo "Server: $SERVER_URL  (set WINB_HOST/WINB_PORT or WINB_URL)"
     echo ""
     echo "Env:"
-    echo "  WINB_HOST   Windows host (default: 192.168.1.100)"
+    echo "  WINB_HOST   Windows host (default: 127.0.0.1, the tunnel/port-forward profile)"
     echo "  WINB_PORT   Port (default: 5110)"
     echo "  WINB_URL    Full base URL (overrides host/port)"
     echo "  WINB_SOCKS  Optional SOCKS/HTTP proxy URL for curl (opt-in only)"
@@ -30,7 +33,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -h, --help               Show this help message"
-    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. F:/AliceWorkspace)"
+    echo "  -w, --workdir <dir>      Working directory on the Windows host (e.g. C:/projects/my-app)"
     echo "  -b, --background         Run command in background (returns immediately)"
     echo "  -id, --process-id <id>   Custom process ID for background task (optional, pairs with -b)"
     echo "  -l, --list               List active/background process records"
@@ -45,9 +48,9 @@ show_help() {
     echo "  -t, --timeout <sec>      Timeout in seconds (for foreground tasks)"
     echo ""
     echo "Examples:"
-    echo "  export WINB_HOST=192.168.1.100 WINB_PORT=5110"
+    echo "  export WINB_HOST=<host> WINB_PORT=5110"
     echo "  winb --health"
-    echo "  winb -w 'F:/AliceWorkspace/my-app' 'npm run dev'"
+    echo "  winb -w 'C:/projects/my-app' 'npm run dev'"
     echo "  winb -b -id server1 'python app.py'"
     echo "  winb -l"
     echo "  winb --open-url http://localhost:3000"
