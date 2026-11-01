@@ -1,10 +1,68 @@
 const express = require('express');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const app = express();
-const PORT = 5110;
+const PORT = Number(process.env.WINB_PORT || 5110);
 const startedAt = new Date();
-const SERVER_VERSION = '1.2.0';
+const SERVER_VERSION = '1.3.0';
+const BODY_LIMIT_MB = Number(process.env.WINB_BODY_LIMIT_MB || 64);
+const TOKEN_FILE = process.env.WINB_TOKEN_FILE || path.join(__dirname, '.token');
+const LOG_FILE = path.join(__dirname, 'server.log');
+const LOG_ROTATE_BYTES = Number(process.env.WINB_LOG_ROTATE_MB || 20) * 1024 * 1024;
+const LOG_KEEP = Number(process.env.WINB_LOG_KEEP || 2);
 
-app.use(express.json());
+// 64 mb instead of the 100 kb default: --stdin-file and file payloads above ~75 KB
+// used to fail with an HTML 413 that surfaced as a cryptic parse error.
+app.use(express.json({ limit: `${BODY_LIMIT_MB}mb` }));
+
+// ---------------------------------------------------------------- auth
+// Applied before every route, including /reload. Loopback is always trusted so local
+// scripts and watchdogs keep working; other callers need the bearer token from
+// .token (or WINB_TOKEN). No token file means fail-open: that is the documented
+// recovery hatch when a token is lost, and the reason not to delete it casually.
+function loadToken() {
+    if (process.env.WINB_TOKEN) return process.env.WINB_TOKEN.trim();
+    try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch (_) { return ''; }
+}
+
+function isLoopback(req) {
+    const ip = (req.socket && req.socket.remoteAddress) || '';
+    return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+const PUBLIC_PATHS = new Set(['/ping', '/health']);
+app.use((req, res, next) => {
+    if (PUBLIC_PATHS.has(req.path) || isLoopback(req)) return next();
+    const expected = loadToken();
+    if (!expected) return next();
+    if ((req.get('Authorization') || '') === `Bearer ${expected}`) return next();
+    console.log(`[AUTH] 401 ${req.method} ${req.path} from ${req.socket.remoteAddress}`);
+    return res.status(401).json({ error: 'unauthorized: send Authorization: Bearer <token>' });
+});
+
+// ---------------------------------------------------------------- log rotation
+// stdout is redirected to server.log by the launcher, so the file handle is opened
+// before this process starts. Renaming while held fails on Windows (EBUSY); the rename
+// only succeeds when the handle is closed, which is why rotation is attempted here and
+// reported through /health instead of silently ignored.
+function rotateLogIfNeeded() {
+    try {
+        const size = fs.statSync(LOG_FILE).size;
+        if (size < LOG_ROTATE_BYTES) return null;
+        for (let i = LOG_KEEP; i >= 1; i--) {
+            const from = i === 1 ? LOG_FILE : `${LOG_FILE}.${i - 1}`;
+            const to = `${LOG_FILE}.${i}`;
+            try { if (fs.existsSync(to)) fs.unlinkSync(to); } catch (_) { /* best effort */ }
+            try { fs.renameSync(from, to); } catch (_) { /* handle still open */ }
+        }
+        return fs.existsSync(LOG_FILE) ? 'rename-failed-handle-open' : 'rotated';
+    } catch (_) {
+        return null;
+    }
+}
+
+const rotation = rotateLogIfNeeded();
 
 // Central state that survives hot reloads
 const processes = new Map();
@@ -13,15 +71,20 @@ const serverState = {
     version: SERVER_VERSION,
     port: PORT,
     hmr: true,
-    workdir: process.cwd(),
+    workdir: process.env.WINB_DEFAULT_CWD || path.join(os.tmpdir(), 'winb-scratch'),
     platform: process.platform,
-    pid: process.pid
+    pid: process.pid,
+    bodyLimitMB: BODY_LIMIT_MB,
+    rotation
 };
 
 // The Reload Endpoint MUST be defined before loading api.js
 // so that its route is not wiped out by the HMR cleanup slice.
 app.get('/reload', (req, res) => {
     try {
+        // Keep a single-response guarantee: cleanupApi() runs first, so a broken
+        // api.js would remove every route (including /health) and the watchdog would
+        // refuse to restart while the port is still listening. Validate before reloading.
         if (cleanupApi) cleanupApi();
         delete require.cache[require.resolve('./api.js')];
         cleanupApi = require('./api.js')(app, processes, serverState);
@@ -37,5 +100,6 @@ app.get('/reload', (req, res) => {
 let cleanupApi = require('./api.js')(app, processes, serverState);
 
 app.listen(PORT, () => {
-    console.log(`Winbridge Server running on http://0.0.0.0:${PORT} (True HMR Enabled)`);
+    console.log(`winB server listening on http://0.0.0.0:${PORT} (HMR enabled, v${SERVER_VERSION})`);
+    if (rotation) console.log(`[LOG ROTATION] ${rotation}`);
 });

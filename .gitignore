@@ -8,3 +8,10 @@ Thumbs.db
 .env.*
 !.env.example
 *.tmp
+
+# runtime state written by the server
+.token
+sessions.json
+jobs.json
+*.bak
+node_modules/

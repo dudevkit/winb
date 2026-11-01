@@ -1,327 +1,1075 @@
-#!/bin/bash
+#!/usr/bin/env -S python3 -S
+"""winb v2 - client for the winb-server bridge (Linux gateway side).
 
-# Target winb-server on Windows. Override with env (portable defaults — no host-specific IPs):
-#   WINB_HOST / WINB_PORT  or full  WINB_URL
-# Optional proxy (only if YOU set it — e.g. userspace Tailscale SOCKS on a gateway):
-#   WINB_SOCKS=socks5h://127.0.0.1:1055
-#   or ALL_PROXY / HTTP_PROXY / http_proxy
-# WINB_NOPROXY=1 forces direct (clears using WINB_SOCKS only; does not unset caller proxies)
-WINB_HOST="${WINB_HOST:-192.168.1.100}"
-WINB_PORT="${WINB_PORT:-5110}"
-SERVER_URL="${WINB_URL:-http://${WINB_HOST}:${WINB_PORT}}"
-if [[ -n "${WINB_SOCKS:-}" && -z "${WINB_NOPROXY:-}" ]]; then
-  # Opt-in only: do not invent a default SOCKS for every clone
-  if [[ -z "${ALL_PROXY:-}${HTTP_PROXY:-}${http_proxy:-}" ]]; then
-    export ALL_PROXY="${WINB_SOCKS}"
-  fi
-fi
+Rewritten from the bash + jq v1 for three reasons:
 
-show_help() {
-    echo "Usage: winb [OPTIONS] \"command\""
-    echo "Executes a command on the remote Windows PC via winb-server."
-    echo "Server: $SERVER_URL  (set WINB_HOST/WINB_PORT or WINB_URL)"
-    echo ""
-    echo "Env:"
-    echo "  WINB_HOST   Windows host (default: 192.168.1.100)"
-    echo "  WINB_PORT   Port (default: 5110)"
-    echo "  WINB_URL    Full base URL (overrides host/port)"
-    echo "  WINB_SOCKS  Optional SOCKS/HTTP proxy URL for curl (opt-in only)"
-    echo "  WINB_NOPROXY=1  Do not apply WINB_SOCKS"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help               Show this help message"
-    echo "  -w, --workdir <dir>      Working directory on the Windows PC (e.g. F:/AliceWorkspace)"
-    echo "  -b, --background         Run command in background (returns immediately)"
-    echo "  -id, --process-id <id>   Custom process ID for background task (optional, pairs with -b)"
-    echo "  -l, --list               List active/background process records"
-    echo "  --logs <id>              Show captured logs for a background process"
-    echo "  --tail <n>               Number of log lines to show with --logs (default 80, max 500)"
-    echo "  --health                 Show winb-server health/status"
-    echo "  --open-url <url>         Open a URL in the Windows default browser"
-    echo "  --port <port>            Check whether a Windows TCP port is in use"
-    echo "  -k, --kill <id>          Kill a background process by ID"
-    echo "  -p, --powershell         Run using PowerShell instead of cmd"
-    echo "  -e, --env KEY=VALUE      Add environment variable for command (repeatable)"
-    echo "  -t, --timeout <sec>      Timeout in seconds (for foreground tasks)"
-    echo ""
-    echo "Examples:"
-    echo "  export WINB_HOST=192.168.1.100 WINB_PORT=5110"
-    echo "  winb --health"
-    echo "  winb -w 'F:/AliceWorkspace/my-app' 'npm run dev'"
-    echo "  winb -b -id server1 'python app.py'"
-    echo "  winb -l"
-    echo "  winb --open-url http://localhost:3000"
-    echo "  winb --port 3000"
-    echo "  winb --logs server1 --tail 50"
-    echo "  winb -e PORT=3001 -e NODE_ENV=development 'npm run dev'"
-    echo "  winb -k server1"
-    echo "  winb -p \"Get-Process | Where-Object Name -eq 'node'\""
-    echo "  winb -t 10 'ping 8.8.8.8'"
-    echo "  # Userspace Tailscale gateway (opt-in):"
-    echo "  export WINB_HOST=100.x.x.x WINB_SOCKS=socks5h://127.0.0.1:1055"
-}
+  1. Latency. v1 spawned jq six times per call, ~2.7 s of pure overhead on this
+     gateway. v2 is one interpreter with the JSON body piped straight into curl,
+     so a round trip costs ~0.2 s instead of ~2.8 s.
+  2. Quoting. The command always travels as base64 inside a JSON body, so no
+     shell (bash, cmd.exe, PowerShell) re-parses it on the way out. `--cmd-file`
+     removes local shell quoting entirely.
+  3. Silent failures. stdout is written as bytes (NUL and lone CR survive), and
+     every failure path prints a reason instead of an empty success.
 
-COMMAND=""
-WORKDIR=""
-BACKGROUND="false"
-PROCESS_ID=""
-LIST="false"
-LOGS_ID=""
-TAIL=80
-HEALTH="false"
-OPEN_URL=""
-PORT_CHECK=""
-KILL_ID=""
-POWERSHELL="false"
-ENV_ARGS=()
-TIMEOUT=0
+`-S` in the shebang skips site initialisation; this client is stdlib only and
+importing urllib alone cost more than the whole request did.
 
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -w|--workdir)
-            WORKDIR="$2"
-            shift 2
-            ;;
-        -b|--background)
-            BACKGROUND="true"
-            shift 1
-            ;;
-        -id|--process-id)
-            PROCESS_ID="$2"
-            shift 2
-            ;;
-        -l|--list)
-            LIST="true"
-            shift 1
-            ;;
-        --logs)
-            LOGS_ID="$2"
-            shift 2
-            ;;
-        --tail)
-            TAIL="$2"
-            shift 2
-            ;;
-        --health)
-            HEALTH="true"
-            shift 1
-            ;;
-        --open-url)
-            OPEN_URL="$2"
-            shift 2
-            ;;
-        --port)
-            PORT_CHECK="$2"
-            shift 2
-            ;;
-        -k|--kill)
-            KILL_ID="$2"
-            shift 2
-            ;;
-        -p|--powershell)
-            POWERSHELL="true"
-            shift 1
-            ;;
-        -e|--env)
-            ENV_ARGS+=("$2")
-            shift 2
-            ;;
-        -t|--timeout)
-            TIMEOUT="$2"
-            shift 2
-            ;;
-        *)
-            if [[ -z "$COMMAND" ]]; then
-                COMMAND="$1"
-            else
-                COMMAND="$COMMAND $1"
-            fi
-            shift 1
-            ;;
-    esac
-done
+Flags, text output format and exit codes stay compatible with v1 (remote exit
+code, 124 on timeout, 1 on transport error). One intentional difference: v1
+stripped trailing newlines through bash command substitution, v2 preserves the
+remote bytes exactly.
+"""
 
-# Handle KILL action
-if [[ -n "$KILL_ID" ]]; then
-    PAYLOAD=$(jq -n --arg pid "$KILL_ID" '{processId: $pid}')
-    curl -s --connect-timeout 5 --max-time 30 -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/kill"
-    echo ""
-    exit 0
-fi
+import base64
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
 
-# Handle OPEN URL action
-if [[ -n "$OPEN_URL" ]]; then
-    PAYLOAD=$(jq -n --arg url "$OPEN_URL" '{url: $url}')
-    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/open-url")
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
-        exit 1
-    fi
-    ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
-    if [[ -n "$ERROR" ]]; then
-        echo "Error: $ERROR" >&2
-        exit 1
-    fi
-    echo "$RESPONSE" | jq -r '"Opened URL: \(.url) (status: \(.status))"'
-    exit 0
-fi
+def _default_server_url():
+    """WINB_URL wins, then WINB_HOST/WINB_PORT, then loopback.
 
-# Handle PORT CHECK action
-if [[ -n "$PORT_CHECK" ]]; then
-    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/port/$PORT_CHECK")
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
-        exit 1
-    fi
-    ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
-    if [[ -n "$ERROR" ]]; then
-        echo "Error: $ERROR" >&2
-        exit 1
-    fi
-    echo "$RESPONSE" | jq -r '
-        "Port \(.port): " + (if .listening then "LISTENING" else "not listening" end),
-        (if (.connections | length) == 0 then "No TCP connections found."
-         else (.connections[] | "  - \(.state) PID \(.pid) " + ((.processName // "unknown") | tostring) + " @ \(.localAddress):\(.localPort)") end)
-    '
-    exit 0
-fi
+    Loopback is the default because the usual deployment keeps the server on the
+    Windows box and reaches it through a tunnel or a port-forward. Point it at the
+    LAN address with WINB_HOST (or WINB_URL) when the gateway talks to it directly.
+    """
+    if os.environ.get("WINB_URL"):
+        return os.environ["WINB_URL"]
+    host = os.environ.get("WINB_HOST", "127.0.0.1")
+    port = os.environ.get("WINB_PORT", "5110")
+    return f"http://{host}:{port}"
 
-# Handle LIST action
-if [[ "$LIST" == "true" ]]; then
-    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/list")
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
-        exit 1
-    fi
-    echo "$RESPONSE" | jq -r 'if (.processes | length) == 0 then "No background process records." else "Background Process Records:\n" + (.processes[] | "  - \(.processId) (PID: \(.pid), \(.status)) :: \(.command)") end'
-    exit 0
-fi
 
-# Handle HEALTH action
-if [[ "$HEALTH" == "true" ]]; then
-    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/health")
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
-        exit 1
-    fi
-    echo "$RESPONSE" | jq -r '
-        "Winb Server: \(.status | ascii_upcase)",
-        "Version: \(.version)",
-        "HMR: \(.hmr)",
-        "PID: \(.pid)",
-        "Port: \(.port)",
-        "Platform: \(.platform)",
-        "Workdir: \(.workdir)",
-        "Started: \(.startedAt)",
-        "Now: \(.now)",
-        "Uptime: \(.uptimeSeconds)s",
-        "Processes: \(.processes.records) records, \(.processes.running) running, \(.processes.exited) exited"
-    '
-    exit 0
-fi
+SERVER_URL = os.environ.get("WINB_SERVER_URL") or _default_server_url()
+SERVER_URL_IS_DEFAULT = not any(os.environ.get(k) for k in
+                                ("WINB_URL", "WINB_SERVER_URL", "WINB_HOST"))
+WINB_SOCKS = os.environ.get("WINB_SOCKS", "")          # e.g. socks5h://127.0.0.1:1055
+TOKEN_PATHS = tuple(x for x in (os.environ.get("WINB_TOKEN_FILE"),
+                               os.path.expanduser("~/.winb-token"),
+                               "/etc/winb-token") if x)
+SSH_KEY = os.environ.get("WINB_SSH_KEY", os.path.expanduser("~/.ssh/winb-admin"))
+SSH_REMOTE = os.environ.get("WINB_SSH_TARGET", "")     # user@host; empty disables --admin
+SSH_DEFAULT_WORKDIR = os.environ.get("WINB_DEFAULT_CWD", "")
+STDIN_MAX = 40_000_000      # raw bytes per --stdin-file; server body limit is 64 mb (base64 inflates 4/3)
+DEFAULT_CLIENT_TIMEOUT = 1800
+CHUNK = 1_000_000           # put/get chunk size
 
-# Handle LOGS action
-if [[ -n "$LOGS_ID" ]]; then
-    RESPONSE=$(curl -s --connect-timeout 5 --max-time 30 "$SERVER_URL/logs/$LOGS_ID?tail=$TAIL")
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Could not connect to winb-server at $SERVER_URL" >&2
-        exit 1
-    fi
-    ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
-    if [[ -n "$ERROR" ]]; then
-        echo "Error: $ERROR" >&2
-        exit 1
-    fi
-    echo "$RESPONSE" | jq -r '
-        "Process: \(.processId) (PID: \(.pid), \(.status))",
-        "Command: \(.command)",
-        "Workdir: \(.workdir)",
-        "--- STDOUT ---",
-        (if (.stdout | length) == 0 then "(empty)" else .stdout[] end),
-        "--- STDERR ---",
-        (if (.stderr | length) == 0 then "(empty)" else .stderr[] end)
-    '
-    exit 0
-fi
+HELP = """Usage: winb [OPTIONS] "command"
 
-# Require command for normal execution
-if [[ -z "$COMMAND" ]]; then
-    echo "Error: Command is required."
-    echo ""
-    show_help
-    exit 1
-fi
+Runs a command on the Windows host through winb-server.
 
-# Build environment JSON safely from repeatable -e/--env KEY=VALUE flags
-ENV_JSON='{}'
-for item in "${ENV_ARGS[@]}"; do
-    if [[ "$item" != *=* ]]; then
-        echo "Error: env must use KEY=VALUE format: $item" >&2
-        exit 1
-    fi
-    key="${item%%=*}"
-    value="${item#*=}"
-    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "Error: invalid env key: $key" >&2
-        exit 1
-    fi
-    ENV_JSON=$(echo "$ENV_JSON" | jq --arg k "$key" --arg v "$value" '. + {($k): $v}')
-done
+Transport
+  -w, --workdir <dir>      working directory on the PC
+  -p, --powershell         run through powershell.exe instead of cmd.exe
+  -t, --timeout <sec>      server-side timeout (kills the process tree)
+  --admin                  run over SSH instead of the HTTP server
+  -e, --env KEY=VALUE      extra environment variable (repeatable)
+  --client-timeout <sec>   give up locally after N seconds (default 1800)
+  --server <url>           override the server URL
 
-# Construct JSON payload safely using jq to avoid string escaping issues
-PAYLOAD=$(jq -n \
-    --arg cmd "$COMMAND" \
-    --arg cwd "$WORKDIR" \
-    --argjson bg "$BACKGROUND" \
-    --arg pid "$PROCESS_ID" \
-    --argjson ps "$POWERSHELL" \
-    --argjson to "$TIMEOUT" \
-    --argjson env "$ENV_JSON" \
-    '{
-        command: $cmd,
-        workdir: (if $cwd == "" then null else $cwd end),
-        background: $bg,
-        processId: (if $pid == "" then null else $pid end),
-        powershell: $ps,
-        timeout: $to,
-        env: $env
-    }')
+Payload
+  --stdin-file <path>      feed this file to the remote command's stdin
+  --cmd-file <path>        read the command from a file (no shell quoting)
+  --raw                    accepted for v1 compatibility; the payload is always
+                           base64 now, so this is a no-op
 
-# Execute request (curl -f would hide body; keep -s and check exit + empty)
-RESPONSE=$(curl -s --connect-timeout 5 --max-time "${CURL_MAX_TIME:-120}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$SERVER_URL/run")
-CURL_RC=$?
-if [[ $CURL_RC -ne 0 ]]; then
-    echo "Error: Could not connect to winb-server at $SERVER_URL (curl exit $CURL_RC)" >&2
-    exit 1
-fi
+Output
+  --json                   print the raw server response JSON
+  --out <path>             save stdout to a local file, print a summary
+  --quiet                  suppress the human-readable footer on --out/--json
 
-# Format output
-if [[ "$BACKGROUND" == "true" ]]; then
-    echo "$RESPONSE" | jq -r 'if .error then "Error: \(.error)" else "Started background process ID: \(.processId) (PID: \(.pid))" end'
-else
-    ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
-    if [[ -n "$ERROR" ]]; then
-        echo "Server Error: $ERROR" >&2
-        exit 1
-    fi
-    
-    STDOUT=$(echo "$RESPONSE" | jq -r '.stdout // empty')
-    STDERR=$(echo "$RESPONSE" | jq -r '.stderr // empty')
-    STATUS=$(echo "$RESPONSE" | jq -r '.status // empty')
-    EXIT_CODE=$(echo "$RESPONSE" | jq -r '.exitCode // empty')
-    
-    if [[ -n "$STDOUT" ]]; then echo -n "$STDOUT"; fi
-    if [[ -n "$STDERR" ]]; then echo -n "$STDERR" >&2; fi
-    
-    if [[ "$STATUS" == "timeout" ]]; then
-        echo -e "\n[Timeout reached after ${TIMEOUT}s]" >&2
-        exit 124
-    fi
-    
-    exit ${EXIT_CODE:-0}
-fi
+Sessions, files, processes (typed endpoints, server v1.3+)
+  -s, --session <id>       apply a sticky workdir/env to this call (explicit -w/-e win)
+  winb session set <id> [-w DIR] [-e K=V]   create/update a session
+  winb session show|rm <id> | winb session list
+  winb ls [path] [--pattern REGEX]          list a directory
+  winb stat <path>                          exists/type/size/mtime/sha256
+  winb read <path> [--out FILE]             stream a file out (chunked)
+  winb rm <path> [--recursive]              delete (guarded, refuses roots)
+  winb ps [filter] [--limit N]              process list with memory
+  winb api <METHOD> <path> [json]           raw typed request
+
+Jobs and info
+  -b, --background         start detached, return immediately
+  -id, --process-id <id>   name for the background process
+  -l, --list               list background process records
+  --logs <id>              show captured logs of a background process
+  --tail <n>               log lines to show with --logs (default 80, max 500)
+  -k, --kill <id>          kill a background process (tree kill)
+  --health                 server health
+  --manifest               device facts in one call: OS, cpu/mem, tool versions,
+                           drives + free space, capabilities, allowed write roots, limits
+  --port <port>            check a TCP port on the PC
+  --open-url <url>         open a URL in the PC's default browser
+  --version                print client and server version
+  -h, --help               this help
+
+Files
+  winb put <local> <remote>   upload a file (chunked, sha256 verified)
+  winb get <remote> <local>   download a file (chunked, sha256 verified)
+  winb doctor                 one-shot device + transport report
+
+Environment
+  WINB_URL / WINB_HOST+WINB_PORT   server address (default http://127.0.0.1:5110)
+  WINB_TOKEN_FILE / WINB_TOKEN     bearer token (also ~/.winb-token, /etc/winb-token)
+  WINB_SOCKS                       proxy for the transport, e.g. socks5h://127.0.0.1:1055
+  WINB_DEFAULT_CWD                 remote working directory for file verbs
+  WINB_SSH_TARGET / WINB_SSH_KEY   enable --admin (user@host + private key)
+  WINB_SHARE_MOUNT                 local mount of the host's SMB share, for `doctor`
+
+Examples
+  export WINB_HOST=<host-ip>
+  winb "echo hi"
+  winb -p "Get-Content C:\\logs\\app.log -Tail 20"
+  winb put ./fix.py "C:\\Temp\\fix.py" && winb -p "python C:\\Temp\\fix.py"
+  winb --out /tmp/big.log "type D:\\data\\big.txt"
+  winb doctor
+"""
+
+
+class WinbError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- transport
+
+def _token():
+    for path in TOKEN_PATHS:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                value = fh.read().strip()
+            if value:
+                return value
+        except OSError:
+            continue
+    return os.environ.get("WINB_TOKEN", "")
+
+
+def _connect_failed(proc):
+    """True when the request never reached the server (safe to replay).
+
+    Connection refused (7) and the connect phase timing out (28 with 'Connection' in the curl
+    message) both mean the TCP session never opened. A read timeout also exits 28 but says
+    'Operation timed out' - that one reached the server and must never be replayed.
+    """
+    if proc.returncode == 7:
+        return True
+    if proc.returncode == 28:
+        return "onnection" in (proc.stderr or b"").decode("utf-8", "replace")
+    return False
+
+
+def _curl(args, data=None, timeout=30, retries=0):
+    argv = ["curl", "-sS", "--connect-timeout", "6", "--max-time", str(int(timeout))]
+    if WINB_SOCKS:
+        argv += ["--socks5-hostname", WINB_SOCKS]
+    if retries:
+        argv += ["--retry", str(retries), "--retry-connrefused"]
+    proc = subprocess.run(argv + args, input=data, capture_output=True)
+    return proc
+
+
+def request(method, path, payload=None, timeout=30, server=None, retries=0):
+    """JSON request to winb-server. Returns (status_code, body_text).
+
+    retries>0 is only safe for idempotent GETs: replaying a POST /run could start
+    the same command on the PC twice.
+    """
+    url = (server or SERVER_URL).rstrip("/") + path
+    args = ["-X", method, "-H", "Content-Type: application/json"]
+    token = _token()
+    if token:
+        args += ["-H", "Authorization: Bearer " + token]
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        args += ["--data-binary", "@-"]
+    args += ["-w", "\n%{http_code}", url]
+
+    attempt = 0
+    while True:
+        proc = _curl(args, data=data, timeout=timeout, retries=0)
+        if _connect_failed(proc):
+            # The request never reached the server, so replaying is safe. This is also the recovery
+            # path after winb-server crashes: the watchdog respawns it in ~15-20 s.
+            if attempt < retries:
+                attempt += 1
+                time.sleep(7)
+                continue
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            if proc.returncode == 122:
+                raise WinbError(f"connection failed: {err}")
+            raise WinbError(
+                f"cannot reach winb-server at {url} after {retries + 1} attempts :: {err or 'refused'}\n"
+                f"       The PC is asleep/off, winb-server is down, or it just crashed and the "
+                f"watchdog (15 s poll) has not respawned it yet. Check `winb --health` or wake the PC."
+                + ("\n       Talking to 127.0.0.1 because no WINB_HOST/WINB_URL is set; export one "
+                   "if the server runs on another host." if SERVER_URL_IS_DEFAULT else ""))
+        break
+
+    out = proc.stdout.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        if proc.returncode in (28, 52):
+            raise WinbError(
+                f"no response from winb-server within {timeout}s :: {err or 'empty reply'}\n"
+                f"       The command is probably still running on the PC (a spawned child can hold "
+                f"stdout open). Check `winb -l`, then `winb -k <id>`.")
+        raise WinbError(f"curl failed (exit {proc.returncode}) for {url} :: {err}")
+
+    body, _, status = out.rpartition("\n")
+    try:
+        code = int(status)
+    except ValueError:
+        return 0, out
+    return code, body
+
+
+def raise_for_status(status, text):
+    if status == 401:
+        raise WinbError(
+            "unauthorized: the server rejected the token.\n"
+            "       The client reads WINB_TOKEN_FILE, ~/.winb-token, /etc/winb-token or "
+            "WINB_TOKEN; the server reads .token next to server.js (or WINB_TOKEN_FILE / "
+            "WINB_TOKEN). Both sides need the same value.")
+    if status == 413:
+        raise WinbError(
+            "server refused the payload (413). The body limit is 64 mb by default "
+            "(WINB_BODY_LIMIT_MB); use `winb put` for files larger than that.")
+
+
+def run_remote(command, workdir=None, powershell=False, timeout=0, env=None,
+               stdin_bytes=None, background=False, process_id=None,
+               client_timeout=None, server=None, session=None):
+    payload = {
+        "cmdB64": base64.b64encode(command.encode("utf-8")).decode("ascii"),
+        "powershell": bool(powershell),
+        "timeout": int(timeout or 0),
+        "env": env or {},
+    }
+    if session:
+        payload["session"] = session
+    if workdir:
+        payload["workdir"] = workdir
+    if stdin_bytes is not None:
+        payload["stdinB64"] = base64.b64encode(stdin_bytes).decode("ascii")
+    if background:
+        payload["background"] = True
+        if process_id:
+            payload["processId"] = process_id
+
+    limit = client_timeout or (int(timeout) + 15 if timeout else DEFAULT_CLIENT_TIMEOUT)
+    status, text = request("POST", "/run", payload, timeout=limit, server=server, retries=3)
+    raise_for_status(status, text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise WinbError(f"server returned non-JSON (HTTP {status}): {text[:300]}")
+
+
+def py_helper(script, env_values, server=None, stdin_bytes=None, timeout=0):
+    """Run a python one-liner on the PC with parameters passed as env vars.
+
+    Interpolating Windows paths into the command string breaks as soon as the
+    path is quoted; an env var travels inside the JSON body and is read back with
+    os.environ, so no shell layer sees the value.
+    """
+    return run_remote(f'python -c "{script}"', env=env_values, server=server,
+                      stdin_bytes=stdin_bytes, timeout=timeout)
+
+
+# ---------------------------------------------------------------- rendering
+
+def emit_stdout(text):
+    """Write stdout as bytes so NUL and lone CR survive."""
+    sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
+    sys.stdout.buffer.flush()
+
+
+def render_exec(result, quiet=False, out_path=None, json_mode=False, timeout_used=0):
+    if json_mode:
+        print(json.dumps(result))
+        return 124 if result.get("status") == "timeout" else int(result.get("exitCode") or 0)
+
+    stdout = result.get("stdout") or ""
+    stderr = result.get("stderr") or ""
+
+    if stdout:
+        if out_path:
+            with open(out_path, "wb") as fh:
+                fh.write(stdout.encode("utf-8", "surrogateescape"))
+            if not quiet:
+                print(f"saved {os.path.getsize(out_path)} bytes -> {out_path}")
+        else:
+            emit_stdout(stdout)
+    if stderr:
+        sys.stderr.buffer.write(stderr.encode("utf-8", "surrogateescape"))
+        sys.stderr.buffer.flush()
+
+    if result.get("status") == "timeout":
+        print(f"\n[timeout after {timeout_used or '?'}s]", file=sys.stderr)
+        return 124
+
+    code = int(result.get("exitCode") or 0)
+    # v1 made "exit 0 with no output" indistinguishable from a swallowed result.
+    if code == 0 and not stdout and not stderr and not quiet and not out_path:
+        print("[no output]", file=sys.stderr)
+    return code
+
+
+def die(msg, code=1):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- ssh path
+
+def default_remote_dir(server=None):
+    """Directory used when a file verb gets no path: WINB_DEFAULT_CWD, else the
+    server's own default (reported by /manifest), else the server's process cwd."""
+    env = os.environ.get("WINB_DEFAULT_CWD")
+    if env:
+        return env
+    try:
+        body = request("GET", "/manifest", timeout=20, server=server, retries=1)[1]
+        info = json.loads(body)
+        cwd = info.get("defaultCwd") or (info.get("server") or {}).get("workdir")
+        if cwd:
+            return cwd
+    except (WinbError, ValueError, AttributeError):
+        pass
+    return "."
+
+
+def admin_run(command, workdir, stdin_bytes):
+    if shutil.which("ssh") is None:
+        die("ssh not available locally")
+    full = command
+    if workdir:
+        full = f"Set-Location -LiteralPath '{workdir}'; {full}"
+    encoded = base64.b64encode(full.encode("utf-8")).decode("ascii")
+    remote_cmd = (f'powershell -NoProfile -Command "iex ([Text.Encoding]::UTF8.GetString('
+                  f'[Convert]::FromBase64String(\'{encoded}\')))"')
+    argv = ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=8", SSH_REMOTE, remote_cmd]
+    proc = subprocess.run(argv, input=stdin_bytes or b"", capture_output=True)
+    if proc.stdout:
+        sys.stdout.buffer.write(proc.stdout)
+        sys.stdout.buffer.flush()
+    if proc.stderr:
+        sys.stderr.buffer.write(proc.stderr)
+        sys.stderr.buffer.flush()
+    sys.exit(proc.returncode)
+
+
+# ---------------------------------------------------------------- file transfer
+
+def _q(value):
+    """Percent-encode a query value without importing urllib (one import costs seconds here)."""
+    safe = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/\\:")
+    out = []
+    for ch in value:
+        if ch in safe:
+            out.append(ch)
+        else:
+            out.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
+    return "".join(out)
+
+
+_FS_SUPPORT = {}
+
+
+def fs_supported(server=None):
+    """True when the server exposes the typed fs.* endpoints (v1.3+)."""
+    key = server or SERVER_URL
+    if key not in _FS_SUPPORT:
+        try:
+            status, text = request("GET", "/manifest", server=server, retries=1, timeout=20)
+            caps = json.loads(text).get("capabilities", []) if status == 200 else []
+            _FS_SUPPORT[key] = "fs.read" in caps
+        except Exception:                              # noqa: BLE001 - old server, fall back
+            _FS_SUPPORT[key] = False
+    return _FS_SUPPORT[key]
+
+
+def api_call(method, path, payload=None, server=None, timeout=120):
+    status, text = request(method, path, payload, server=server, retries=1, timeout=timeout)
+    if status == 404 and "Cannot" in text[:200]:
+        raise WinbError(
+            f"this server does not expose {path.split('?')[0]} - it predates v1.3.\n"
+            f"       Raw commands, put/get and the job endpoints still work there; update the "
+            f"server (api.js + server.js v1.3) to get the typed fs/proc/session surface.")
+    raise_for_status(status, text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise WinbError(f"server returned non-JSON (HTTP {status}): {text[:200]}")
+
+
+def cmd_api(method, path, body, server=None):
+    payload = None
+    if body:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            die(f"request body must be JSON: {body[:80]}")
+    print(json.dumps(api_call(method.upper(), path, payload, server=server), indent=2))
+    return 0
+
+
+def session_target(positional):
+    """Accept either `session set <id>` or `session set --session <id>` shapes."""
+    opts = [a for a in positional if not a.startswith("-")]
+    return opts
+
+
+def cmd_session(action, args, server=None):
+    parsed = {"env": []}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-w", "--workdir"):
+            parsed["workdir"] = args[i + 1]
+            i += 2
+            continue
+        if arg in ("-e", "--env"):
+            parsed["env"].append(args[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--server="):
+            server = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        parsed.setdefault("id", arg)
+        i += 1
+
+    sid = parsed.get("id")
+    if action == "list":
+        for row in api_call("GET", "/sessions", server=server).get("sessions", []):
+            print(f"  {row['id']:20} {row.get('workdir') or '-'}  env={len(row.get('env') or {})}")
+        return 0
+    if not sid:
+        die("usage: winb session set|show|rm <id> [-w DIR] [-e KEY=VALUE] | winb session list")
+
+    if action in ("set", "create"):
+        payload = {}
+        if parsed.get("workdir"):
+            payload["workdir"] = parsed["workdir"]
+        env = {}
+        for item in parsed["env"]:
+            if "=" not in item:
+                die(f"env must be KEY=VALUE: {item}")
+            key, value = item.split("=", 1)
+            env[key] = value
+        if env:
+            payload["env"] = env
+        row = api_call("POST", "/session", {"id": sid, **payload}, server=server)
+        print(f"session {row['id']}: workdir={row.get('workdir')} env={row.get('env')}")
+        return 0
+    if action == "show":
+        row = api_call("GET", f"/session/{_q(sid)}", server=server)
+        print(json.dumps(row, indent=2))
+        return 0
+    if action in ("rm", "delete"):
+        print(api_call("DELETE", f"/session/{_q(sid)}", server=server))
+        return 0
+    die(f"unknown session action: {action} (set|show|rm|list)")
+
+
+def cmd_fs(action, args, server=None):
+    """ls / stat / read / rm helpers on top of the typed endpoints."""
+    parsed = {"recursive": False}
+    positional = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--recursive":
+            parsed["recursive"] = True
+            i += 1
+            continue
+        if arg.startswith("--server="):
+            server = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg in ("--pattern", "--filter"):
+            parsed["pattern"] = args[i + 1]
+            i += 2
+            continue
+        if arg == "--out":
+            parsed["out"] = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--"):
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+
+    target = positional[0] if positional else None
+
+    if action == "ls":
+        query = f"/fs/list?path={_q(target or default_remote_dir(server))}"
+        if parsed.get("pattern"):
+            query += f"&pattern={_q(parsed['pattern'])}"
+        data = api_call("GET", query, server=server)
+        if not data.get("entries"):
+            print(f"[empty] {data.get('path')}")
+            return 0
+        print(f"{data['path']}  ({data['count']} entries)")
+        for row in data["entries"]:
+            kind = "dir " if row["type"] == "dir" else "file"
+            size = "" if row["type"] == "dir" else str(row["size"])
+            stamp = (row.get("mtime") or "")[:19].replace("T", " ")
+            print(f"  {kind} {stamp:19} {size:>10}  {row['name']}")
+        return 0
+
+    if action == "stat":
+        if not target:
+            die("usage: winb stat <path>")
+        print(json.dumps(api_call("GET", f"/fs/stat?path={_q(target)}&sha256=1", server=server), indent=2))
+        return 0
+
+    if action == "read":
+        if not target:
+            die("usage: winb read <path> [--out FILE]")
+        stat = api_call("GET", f"/fs/stat?path={_q(target)}", server=server)
+        if not stat.get("exists") or stat.get("type") != "file":
+            die(f"not a readable file: {target} ({stat.get('error', stat.get('type'))})")
+        total = stat["size"]
+        sink = open(parsed["out"], "wb") if parsed.get("out") else sys.stdout.buffer
+        if parsed.get("out"):
+            print(f"reading {total} bytes -> {parsed['out']}")
+        CHUNK_READ = 1_000_000
+        offset = 0
+        try:
+            while offset < total:
+                block = api_call(
+                    "GET",
+                    f"/fs/read?path={_q(target)}&offset={offset}&length={CHUNK_READ}&encoding=base64",
+                    server=server, timeout=300)
+                raw = base64.b64decode(block.get("content") or "")
+                if not raw:
+                    break
+                sink.write(raw)
+                offset += len(raw)
+        finally:
+            if parsed.get("out"):
+                sink.close()
+        return 0
+
+    if action == "rm":
+        if not target:
+            die("usage: winb rm <path> [--recursive]")
+        payload = {"path": target, "recursive": bool(parsed["recursive"])}
+        print(json.dumps(api_call("POST", "/fs/rm", payload, server=server), indent=2))
+        return 0
+
+    die(f"unknown fs action: {action} (ls|stat|read|rm)")
+
+
+def cmd_ps(args, server=None):
+    filt = None
+    limit = 40
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--server="):
+            server = arg.split("=", 1)[1]
+        elif arg == "--limit":
+            limit = int(args[i + 1]); i += 1
+        elif not arg.startswith("-"):
+            filt = arg
+        i += 1
+    query = f"/proc/list?limit={limit}" + (f"&filter={_q(filt)}" if filt else "")
+    data = api_call("GET", query, server=server, timeout=180)
+    print(f"{'PID':>8}  {'MEM MB':>8}  NAME")
+    for row in data.get("processes", []):
+        print(f"{row['pid']:>8}  {row.get('memMB') or 0:>8}  {row.get('name')}")
+    print(f"{data.get('count')} matching processes")
+    return 0
+
+
+def remote_sha256(path, server=None):
+    result = py_helper("import hashlib,os;print(hashlib.sha256(open(os.environ['WINB_PATH'],'rb')"
+                       ".read()).hexdigest())", {"WINB_PATH": path}, server=server)
+    return (result.get("stdout") or "").strip()
+
+
+def put_typed(local, remote, server=None, chunk=CHUNK, quiet=False):
+    size = os.path.getsize(local)
+    digest = hashlib.sha256()
+    with open(local, "rb") as fh:
+        sent = 0
+        first = True
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+            result = api_call("POST", "/fs/write", {
+                "path": remote,
+                "dataB64": base64.b64encode(block).decode("ascii"),
+                "append": not first,
+                "mkdirs": True
+            }, server=server, timeout=300)
+            sent += len(block)
+            first = False
+            if not quiet:
+                sys.stderr.write(f"\r  {sent}/{size} bytes")
+    stat = api_call("GET", f"/fs/stat?path={_q(remote)}&sha256=1", server=server)
+    if size and stat.get("sha256") != digest.hexdigest():
+        die(f"sha256 mismatch after upload: local {digest.hexdigest()[:16]} remote {(stat.get('sha256') or '?')[:16]}")
+    if not quiet:
+        sys.stderr.write("\r" + " " * 40 + "\r")
+        print(f"put {size} bytes -> {remote} (sha256 {digest.hexdigest()[:16]} verified, typed fs)")
+    return 0
+
+
+def get_typed(remote, local, server=None, chunk=1_000_000, quiet=False):
+    stat = api_call("GET", f"/fs/stat?path={_q(remote)}", server=server)
+    if not stat.get("exists") or stat.get("type") != "file":
+        die(f"remote file not readable: {remote} ({stat.get('error', stat.get('type'))})")
+    total = stat["size"]
+    digest = hashlib.sha256()
+    tmp = local + ".winb-part"
+    written = 0
+    with open(tmp, "wb") as fh:
+        offset = 0
+        while offset < total:
+            block = api_call("GET",
+                             f"/fs/read?path={_q(remote)}&offset={offset}&length={chunk}&encoding=base64",
+                             server=server, timeout=300)
+            raw = base64.b64decode(block.get("content") or "")
+            if not raw:
+                break
+            fh.write(raw)
+            digest.update(raw)
+            written += len(raw)
+            offset += len(raw)
+            if not quiet:
+                sys.stderr.write(f"\r  {written}/{total} bytes")
+    os.replace(tmp, local)
+    remote_stat = api_call("GET", f"/fs/stat?path={_q(remote)}&sha256=1", server=server)
+    if total and remote_stat.get("sha256") != digest.hexdigest():
+        die(f"sha256 mismatch after download: local {digest.hexdigest()[:16]} remote {(remote_stat.get('sha256') or '?')[:16]}")
+    if not quiet:
+        sys.stderr.write("\r" + " " * 40 + "\r")
+        print(f"get {written} bytes <- {remote} (sha256 {digest.hexdigest()[:16]} verified, typed fs)")
+    return 0
+
+
+def cmd_put(local, remote, server=None, chunk=CHUNK, quiet=False):
+    if not os.path.isfile(local):
+        die(f"local file not found: {local}")
+    if fs_supported(server):
+        return put_typed(local, remote, server=server, chunk=chunk, quiet=quiet)
+    size = os.path.getsize(local)
+    digest = hashlib.sha256()
+    with open(local, "rb") as fh:
+        sent = 0
+        first = True
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+            helper = ("import sys,os,pathlib;"
+                      "p=pathlib.Path(os.environ['WINB_PATH']);"
+                      "p.parent.mkdir(parents=True, exist_ok=True);"
+                      "open(p,os.environ['WINB_MODE']).write(sys.stdin.buffer.read())")
+            result = py_helper(helper, {"WINB_PATH": remote, "WINB_MODE": "wb" if first else "ab"},
+                               server=server, stdin_bytes=block)
+            if result.get("status") == "timeout" or (result.get("exitCode") or 0) != 0:
+                die(f"upload failed at offset {sent}: "
+                    f"{(result.get('stderr') or result.get('error') or '').strip()[:200]}")
+            sent += len(block)
+            first = False
+    local_hex = digest.hexdigest()
+    if size:
+        remote_hex = remote_sha256(remote, server=server)
+        if remote_hex and remote_hex != local_hex:
+            die(f"sha256 mismatch after upload: local {local_hex[:16]} remote {remote_hex[:16]}")
+    if not quiet:
+        print(f"put {size} bytes -> {remote} (sha256 {local_hex[:16]} verified)")
+    return 0
+
+
+def cmd_get(remote, local, server=None, chunk=500000, quiet=False):
+    if fs_supported(server):
+        return get_typed(remote, local, server=server, quiet=quiet)
+    probe = py_helper("import os;print(os.path.getsize(os.environ['WINB_PATH']))",
+                      {"WINB_PATH": remote}, server=server)
+    if (probe.get("exitCode") or 0) != 0:
+        die(f"remote file not readable: {remote}: {(probe.get('stderr') or '').strip()[:200]}")
+    size = int((probe.get("stdout") or "0").strip() or 0)
+    digest = hashlib.sha256()
+    written = 0
+    tmp = local + ".winb-part"
+    with open(tmp, "wb") as fh:
+        offset = 0
+        while offset < size:
+            helper = ("import base64,os,sys;"
+                      "fh=open(os.environ['WINB_PATH'],'rb');"
+                      "fh.seek(int(os.environ['WINB_OFFSET']));"
+                      "sys.stdout.buffer.write(base64.b64encode(fh.read(int(os.environ['WINB_LEN']))))")
+            result = run_remote(f'python -c "{helper}"', server=server, timeout=120,
+                                env={"WINB_PATH": remote, "WINB_OFFSET": str(offset),
+                                     "WINB_LEN": str(chunk)})
+            if (result.get("exitCode") or 0) != 0:
+                die(f"download failed at offset {offset}: {(result.get('stderr') or '')[:200]}")
+            block = base64.b64decode((result.get("stdout") or "").strip())
+            if not block:
+                break
+            fh.write(block)
+            digest.update(block)
+            written += len(block)
+            offset += chunk
+    os.replace(tmp, local)
+    if size:
+        remote_hex = remote_sha256(remote, server=server)
+        if remote_hex and remote_hex != digest.hexdigest():
+            die(f"sha256 mismatch after download: local {digest.hexdigest()[:16]} remote {remote_hex[:16]}")
+    if not quiet:
+        print(f"get {written} bytes <- {remote} (sha256 {digest.hexdigest()[:16]} verified)")
+    return 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(server=None):
+    rows = []
+
+    def probe(label, fn):
+        start = time.time()
+        try:
+            value = fn()
+        except Exception as exc:                      # noqa: BLE001 - report, never crash
+            value = f"ERROR: {exc}"
+        rows.append((label, round(time.time() - start, 2), str(value).strip()))
+
+    probe("server version", lambda: json.loads(request("GET", "/health", timeout=10,
+                                                       server=server, retries=1)[1])["version"])
+    probe("auth + manifest", lambda: (
+        lambda m: f"host={m['host']} auth={m['authRequired']} body={m['limits']['bodyMB']}mb"
+    )(json.loads(request("GET", "/manifest", timeout=30, server=server, retries=1)[1])))
+    probe("echo round trip", lambda: run_remote("echo winb", server=server)["stdout"].strip())
+    probe("powershell round trip", lambda: run_remote("Write-Output winb", powershell=True,
+                                                      server=server)["stdout"].strip())
+    probe("utf8 probe U+2713", lambda: run_remote("[Console]::Out.Write([char]0x2713)", powershell=True,
+                                                  server=server)["stdout"].encode("utf-8").hex())
+    probe("default cwd", lambda: run_remote("cd", server=server)["stdout"].strip())
+    probe("python on PC", lambda: (run_remote("python -V", server=server).get("stdout")
+                                   or run_remote("python -V", server=server).get("stderr") or "").strip())
+    probe("node on PC", lambda: run_remote("node --version", server=server)["stdout"].strip())
+    probe("git on PC", lambda: run_remote("git --version", server=server)["stdout"].strip())
+    probe("drives", lambda: " | ".join(
+        f"{d['name']} {d.get('freeGB', '?')}G free"
+        for d in json.loads(request("GET", "/manifest", timeout=30, server=server,
+                                    retries=1)[1]).get("drives", [])) or "none reported")
+    # Set WINB_SHARE_MOUNT to the path where this gateway mounts the host's share; the
+    # transport report is skipped when it is unset (the mount is optional by design).
+    if os.environ.get("WINB_SHARE_MOUNT"):
+        mount = os.environ["WINB_SHARE_MOUNT"]
+        probe("share mount", lambda: subprocess.run(
+            ["findmnt", "-no", "OPTIONS", mount], capture_output=True,
+            text=True).stdout.strip() or f"NOT MOUNTED ({mount})")
+    probe("client", lambda: f"winb v2 python {sys.version.split()[0]}")
+
+    width = max(len(r[0]) for r in rows)
+    print(f"{'check'.ljust(width)}  {'secs':>6}  result")
+    print("-" * (width + 50))
+    for label, secs, value in rows:
+        print(f"{label.ljust(width)}  {secs:>6}  {value}")
+    return 1 if any("ERROR" in r[2] for r in rows) else 0
+
+
+# ---------------------------------------------------------------- main
+
+def parse(argv):
+    """Hand-rolled parser mirroring v1: flags anywhere, everything else is the command."""
+    opts = {"command_parts": []}
+    value_flags = {"-w": "workdir", "--workdir": "workdir", "-id": "process_id",
+                   "--process-id": "process_id", "--logs": "logs", "--tail": "tail",
+                   "--open-url": "open_url", "--port": "port", "-k": "kill", "--kill": "kill",
+                   "-e": "env", "--env": "env", "-t": "timeout", "--timeout": "timeout",
+                   "--stdin-file": "stdin_file", "--cmd-file": "cmd_file", "--out": "out",
+                   "--server": "server", "--client-timeout": "client_timeout",
+                   "--session": "session", "-s": "session", "--path": "path", "--length": "length",
+                   "--offset": "offset"}
+    bool_flags = {"-b": "background", "--background": "background", "-l": "list", "--list": "list",
+                  "--health": "health", "-p": "powershell", "--powershell": "powershell",
+                  "--raw": "raw", "--admin": "admin", "--json": "json", "--quiet": "quiet",
+                  "--version": "version", "--manifest": "manifest", "--recursive": "recursive",
+                  "-h": "help", "--help": "help"}
+
+    def coerce(name, value):
+        if name in ("timeout", "client_timeout", "tail", "length", "offset"):
+            try:
+                return int(value)
+            except ValueError:
+                die(f"{name} must be an integer, got {value!r}")
+        return value
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in value_flags:
+            if i + 1 >= len(argv):
+                die(f"{arg} needs a value")
+            name = value_flags[arg]
+            value = coerce(name, argv[i + 1])
+            if name == "env":
+                opts.setdefault("env", []).append(value)
+            else:
+                opts[name] = value
+            i += 2
+            continue
+        if arg in bool_flags:
+            opts[bool_flags[arg]] = True
+            i += 1
+            continue
+        if arg.startswith("--") and "=" in arg:
+            name, value = arg.split("=", 1)
+            if name in value_flags:
+                key = value_flags[name]
+                value = coerce(key, value)
+                if key == "env":
+                    opts.setdefault("env", []).append(value)
+                else:
+                    opts[key] = value
+                i += 1
+                continue
+        opts["command_parts"].append(arg)
+        i += 1
+    return opts
+
+
+def main():
+    argv = sys.argv[1:]
+
+    if argv and argv[0] in ("put", "get", "doctor", "ls", "stat", "read", "cat", "rm", "ps",
+                            "session", "api", "write"):
+        sub = argv[0]
+        rest = argv[1:]
+        server = None
+        positional = []
+        for arg in rest:
+            if arg.startswith("--server="):
+                server = arg.split("=", 1)[1]
+            elif not arg.startswith("--"):
+                positional.append(arg)
+
+        if sub == "doctor":
+            sys.exit(cmd_doctor(server=server))
+        if sub in ("put", "write"):
+            if len(positional) != 2:
+                die("usage: winb put <local> <remote>")
+            sys.exit(cmd_put(positional[0], positional[1], server=server))
+        if sub == "get":
+            if len(positional) != 2:
+                die("usage: winb get <remote> <local>")
+            sys.exit(cmd_get(positional[0], positional[1], server=server))
+        if sub in ("read", "cat"):
+            sys.exit(cmd_fs("read", rest, server=server))
+        if sub in ("ls", "stat", "rm"):
+            sys.exit(cmd_fs(sub, rest, server=server))
+        if sub == "ps":
+            sys.exit(cmd_ps(rest, server=server))
+        if sub == "session":
+            if not rest:
+                sys.exit(cmd_session("list", [], server=server))
+            sys.exit(cmd_session(rest[0], rest[1:], server=server))
+        if sub == "api":
+            if len(positional) < 2:
+                die('usage: winb api <METHOD> <path> [json-body]')
+            sys.exit(cmd_api(positional[0], positional[1], positional[2] if len(positional) > 2 else None,
+                             server=server))
+
+    opts = parse(argv)
+    if opts.get("help"):
+        print(HELP)
+        sys.exit(0)
+
+    server = opts.get("server", SERVER_URL)
+
+    if opts.get("version"):
+        try:
+            server_version = json.loads(request("GET", "/health", timeout=8, server=server,
+                                                retries=1)[1]).get("version", "?")
+        except WinbError as exc:
+            server_version = f"unreachable ({exc})"
+        print(f"winb client 2.0.0 | server {server_version}")
+        sys.exit(0)
+
+    command = " ".join(opts["command_parts"]).strip()
+    if opts.get("cmd_file"):
+        try:
+            with open(opts["cmd_file"], "r", encoding="utf-8") as fh:
+                file_command = fh.read()
+        except OSError as exc:
+            die(f"cannot read --cmd-file: {exc}")
+        command = file_command if not command else f"{file_command}\n{command}"
+
+    env = {}
+    for item in opts.get("env", []) or []:
+        if "=" not in item:
+            die(f"env must be KEY=VALUE: {item}")
+        key, value = item.split("=", 1)
+        env[key] = value
+
+    stdin_bytes = None
+    if opts.get("stdin_file"):
+        try:
+            with open(opts["stdin_file"], "rb") as fh:
+                stdin_bytes = fh.read()
+        except OSError as exc:
+            die(f"cannot read --stdin-file: {exc}")
+        if len(stdin_bytes) > STDIN_MAX:
+            die(f"stdin payload is {len(stdin_bytes)} bytes, over the {STDIN_MAX} cap.\n"
+                f"       Use `winb put <file> <remote-path>` (chunked, sha256 verified) instead.")
+
+    timeout = int(opts.get("timeout", 0) or 0)
+
+    if opts.get("admin"):
+        if opts.get("background"):
+            die("--admin cannot be combined with --background")
+        if not command:
+            die("a command is required")
+        if not SSH_REMOTE:
+            die("--admin needs WINB_SSH_TARGET (user@host) and WINB_SSH_KEY; "
+                "without them there is no SSH route configured.")
+        admin_run(command, opts.get("workdir") or SSH_DEFAULT_WORKDIR, stdin_bytes)
+
+    # --- non-exec actions, v1-compatible text ---------------------------------
+    if opts.get("kill"):
+        status, text = request("POST", "/kill", {"processId": opts["kill"]}, server=server)
+        payload = json.loads(text) if text else {}
+        if "error" in payload:
+            die(payload["error"])
+        print()
+        sys.exit(0)
+
+    if opts.get("open_url"):
+        status, text = request("POST", "/open-url", {"url": opts["open_url"]}, server=server)
+        payload = json.loads(text) if text else {}
+        if "error" in payload:
+            die(payload["error"])
+        print(f"Opened URL: {payload.get('url')} (status: {payload.get('status')})")
+        sys.exit(0)
+
+    if opts.get("port"):
+        status, text = request("GET", f"/port/{opts['port']}", server=server, retries=1)
+        payload = json.loads(text) if text else {}
+        if "error" in payload:
+            die(payload["error"])
+        state = "LISTENING" if payload.get("listening") else "not listening"
+        print(f"Port {payload.get('port')}: {state}")
+        conns = payload.get("connections") or []
+        if not conns:
+            print("No TCP connections found.")
+        for row in conns:
+            name = row.get("processName") or "unknown"
+            print(f"  - {row.get('state')} PID {row.get('pid')} {name} "
+                  f"@ {row.get('localAddress')}:{row.get('localPort')}")
+        sys.exit(0)
+
+    if opts.get("list"):
+        status, text = request("GET", "/list", server=server, retries=1)
+        procs = (json.loads(text) if text else {}).get("processes") or []
+        if not procs:
+            print("No background process records.")
+        else:
+            print("Background Process Records:\n")
+            for row in procs:
+                print(f"  - {row.get('processId')} (PID: {row.get('pid')}, {row.get('status')}) "
+                      f":: {row.get('command')}")
+        sys.exit(0)
+
+    if opts.get("manifest"):
+        status, text = request("GET", "/manifest", server=server, retries=1)
+        raise_for_status(status, text)
+        print(json.dumps(json.loads(text), indent=2))
+        sys.exit(0)
+
+    if opts.get("health"):
+        status, text = request("GET", "/health", server=server, retries=1)
+        raise_for_status(status, text)
+        info = json.loads(text)
+        print(f"Winb Server: {str(info.get('status')).upper()}")
+        print(f"Version: {info.get('version')}")
+        print(f"HMR: {str(info.get('hmr')).lower()}")
+        print(f"PID: {info.get('pid')}")
+        print(f"Port: {info.get('port')}")
+        print(f"Platform: {info.get('platform')}")
+        print(f"Workdir: {info.get('workdir')}")
+        print(f"Started: {info.get('startedAt')}")
+        print(f"Now: {info.get('now')}")
+        print(f"Uptime: {info.get('uptimeSeconds')}s")
+        counts = info.get("processes") or {}
+        print(f"Processes: {counts.get('records')} records, {counts.get('running')} running, "
+              f"{counts.get('exited')} exited")
+        sys.exit(0)
+
+    if opts.get("logs"):
+        tail = int(opts.get("tail", 80) or 80)
+        status, text = request("GET", f"/logs/{opts['logs']}?tail={tail}", server=server, retries=1)
+        payload = json.loads(text) if text else {}
+        if "error" in payload:
+            die(payload["error"])
+        print(f"Process: {payload.get('processId')} (PID: {payload.get('pid')}, {payload.get('status')})")
+        print(f"Command: {payload.get('command')}")
+        print(f"Workdir: {payload.get('workdir')}")
+        print("--- STDOUT ---")
+        out = payload.get("stdout") or []
+        print("(empty)" if not out else "\n".join(out))
+        print("--- STDERR ---")
+        err = payload.get("stderr") or []
+        print("(empty)" if not err else "\n".join(err))
+        sys.exit(0)
+
+    # --- exec -----------------------------------------------------------------
+    if not command:
+        print("Error: Command is required.\n")
+        print(HELP)
+        sys.exit(1)
+
+    result = run_remote(command, workdir=opts.get("workdir"),
+                        powershell=opts.get("powershell", False), timeout=timeout, env=env,
+                        stdin_bytes=stdin_bytes, background=opts.get("background", False),
+                        process_id=opts.get("process_id"), client_timeout=opts.get("client_timeout"),
+                        server=server, session=opts.get("session"))
+
+    if opts.get("background"):
+        if result.get("error"):
+            die(result["error"])
+        print(f"Started background process ID: {result.get('processId')} (PID: {result.get('pid')})")
+        sys.exit(0)
+
+    if result.get("error") and "stdout" not in result:
+        err = str(result["error"])
+        if "ENOENT" in err:
+            workdir = opts.get("workdir") or "(server default)"
+            die(f"spawn failed: {err}\n"
+                f"       workdir '{workdir}' does not exist or is not usable on the PC.\n"
+                f"       The server also crashes on this error and the watchdog respawns it in "
+                f"~15-20 s; the next call will wait for it. Fix the path and retry.")
+        die(f"server: {err}")
+
+    sys.exit(render_exec(result, quiet=opts.get("quiet", False), out_path=opts.get("out"),
+                         json_mode=opts.get("json", False), timeout_used=timeout))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except WinbError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        die("interrupted", 130)
