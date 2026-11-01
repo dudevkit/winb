@@ -111,7 +111,7 @@ server-like a timeout (`-t`) so a hung child cannot hold the request open.
   bootstrap (`server.js`) needs a real restart. The reload handler runs `cleanupApi()` before
   `require()` — a file that throws removes every route, including `/health`. Validate with
   `node --check` and keep a backup before reloading. Details in
-  [winb-v1.3.md](winb-v1.3.md#server-edits-hmr-and-recovery).
+  [winb-v1.3.md](winb-v1.3.md#5-server-edits-hmr-and-recovery).
 - **PATH is not the interactive user's PATH.** Commands installed as user-level global shims
   (for example npm's `%APPDATA%\npm`) can be invisible to the server process even though the
   app is installed. The API prepends `%APPDATA%\npm`; if something still does not resolve,
