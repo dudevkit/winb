@@ -241,14 +241,17 @@ def _history_local():
     local = pathlib.Path(win) if os.path.isabs(win) else None
     if local and local.is_dir():
         return local
-    parts = win.split("/")
-    # F:/AliceWorkspace/winb-server/history -> //host/AliceWorkspace is mounted locally; match on
-    # the tail so the test also works when the share name differs from the folder name.
+    parts = [p for p in win.split("/") if p]
+    if len(parts) < 2:
+        return None
+    tail = parts[1:]            # drop the drive letter: AliceWorkspace/winb-server/history
     for mount in sorted(pathlib.Path("/mnt").glob("*")):
-        tail = parts[2:] if len(parts) > 2 else parts
-        cand = mount.joinpath(*tail[1:]) if len(tail) > 1 else mount
-        if cand.is_dir():
-            return cand
+        if not mount.is_dir() or mount.name == "alice":
+            continue                # /mnt/alice is the gateway's own disk, not a share
+        # a mount either exposes the drive root or the drive's first subdirectory
+        for cand in (mount.joinpath(*tail), mount.joinpath(*tail[1:]) if len(tail) > 1 else mount):
+            if cand.is_dir():
+                return cand
     return None
 
 
@@ -278,8 +281,8 @@ if hist_dir is None:
           "skipped: history dir not readable from this host (no share mounted)")
 else:
     before_events, before_dups = event_snapshot(hist_dir)
-    restart_code, _ = winb(["-p", "Stop-Process -Id (Get-NetTCPConnection -LocalPort 5110 "
-                                  "-State Listen).OwningProcess -Force; 'restarting'"])
+    restart_code, _, _ = winb(["-p", "Stop-Process -Id (Get-NetTCPConnection -LocalPort 5110 "
+                                   "-State Listen).OwningProcess -Force; 'restarting'"])
     new_pid = None
     for _ in range(60):
         time.sleep(1)
@@ -289,11 +292,13 @@ else:
             break
     time.sleep(int((tracking.get("sampleSec") or 60)) + 3)
     after_events, after_dups = event_snapshot(hist_dir)
+    # restart_code is knowingly non-zero: the command runs inside the node it kills, so the
+    # process dies before it can return a result. The pid change is what actually proves it ran.
     check("19 restart does not duplicate history events",
-          restart_code == 0 and new_pid is not None and before_dups == 0 and after_dups == 0
+          new_pid is not None and before_dups == 0 and after_dups == 0
           and after_events >= before_events,
-          f"pid {before_pid} -> {new_pid}, events {before_events} -> {after_events}, "
-          f"dups {before_dups} -> {after_dups}")
+          f"pid {before_pid} -> {new_pid} (rc={restart_code}), "
+          f"events {before_events} -> {after_events}, dups {before_dups} -> {after_dups}")
 
 failed = [r for r in RESULTS if not r[1]]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
