@@ -4,6 +4,11 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// Singleton: require cache keeps one instance across GET /reload. The sampler owns the
+// probe child process and the sampling interval, so it must live outside this module's
+// lifecycle or every reload would leak another one.
+const sampler = require('./sampler.js');
+
 // ---------------------------------------------------------------- config
 
 const SERVER_DIR = __dirname;
@@ -177,7 +182,7 @@ function saveJobs(processes) {
 
 module.exports = function (app, processes, serverState = {}) {
     const initialStackLength = app._router.stack.length;
-    const version = serverState.version || '1.3.0';
+    const version = serverState.version || '1.4.0';
 
     // Auth lives in server.js, registered before /reload, so it also covers the reload
     // endpoint. Loading the module by hand (without server.js) leaves the API open, which
@@ -229,7 +234,10 @@ module.exports = function (app, processes, serverState = {}) {
             drives: driveList.map((d) => ({ name: d.Name, freeGB: d.FreeGB, usedGB: d.UsedGB })),
             capabilities: ['exec', 'put', 'get', 'fs.stat', 'fs.list', 'fs.read', 'fs.write',
                 'fs.mkdir', 'fs.move', 'fs.rm', 'proc.list', 'proc.kill', 'proc.logs',
-                'port.check', 'open-url', 'manifest', 'jobs', 'sessions'],
+                'port.check', 'open-url', 'manifest', 'jobs', 'sessions',
+                'state', 'timeline', 'apps', 'history.purge'],
+            // What is being collected about this host, always inspectable without reading code.
+            tracking: sampler.status(),
             allowedWriteRoots: ALLOWED_ROOTS,
             limits: {
                 bodyMB: serverState.bodyLimitMB || 0.1,
@@ -245,11 +253,13 @@ module.exports = function (app, processes, serverState = {}) {
     app.get('/manifest', (req, res) => {
         const force = req.query.refresh === '1';
         const fresh = force || !manifestCache.data || Date.now() - manifestCache.at > MANIFEST_TTL;
-        if (!fresh) return res.json(manifestCache.data);
+        // tracking is merged live, not cached: the manifest cache is 10 minutes and the
+        // tracking flags are exactly what an operator wants to see as it currently is.
+        if (!fresh) return res.json({ ...manifestCache.data, tracking: sampler.status() });
         buildManifest()
             .then((data) => {
                 manifestCache = { at: Date.now(), data };
-                res.json(data);
+                res.json({ ...data, tracking: sampler.status() });
             })
             .catch((err) => {
                 // never leak a rejection: an unhandled one takes the whole server down
@@ -544,7 +554,19 @@ module.exports = function (app, processes, serverState = {}) {
                 records: records.length,
                 running: records.filter(p => !p.exited).length,
                 exited: records.filter(p => p.exited).length
-            }
+            },
+            // /health is public, so this stays non-identifying: no user name, no titles.
+            // Detail lives behind the token on /state.
+            state: (() => {
+                const st = sampler.status();
+                const sample = sampler.lastSample || {};
+                return {
+                    tracking: st.enabled && st.sampling ? (st.degraded ? 'degraded' : 'on') : 'off',
+                    session: sampler.sessionState(sample.idleSec),
+                    bootTime: sample.boot || null,
+                    lastSampleAgoSec: st.lastTick ? Math.max(0, Math.round((Date.now() - Date.parse(st.lastTick)) / 1000)) : null
+                };
+            })()
         });
     });
 
@@ -895,6 +917,60 @@ module.exports = function (app, processes, serverState = {}) {
         killer.once('close', (code) => {
             res.json({ status: code === 0 ? 'killed' : 'failed', pid: pid || null, name: name || null, exitCode: code, stdout: out.trim(), stderr: err.trim() });
         });
+    });
+
+    // ---- host context (v1.4): sampler state, timeline, app usage
+    // These five endpoints expose who uses the host and for what. server.js requires the
+    // bearer token for them even from loopback (WINB_PRIVATE_API, default on).
+    app.get('/state', (req, res) => {
+        try {
+            res.json(sampler.state());
+        } catch (err) {
+            res.status(500).json({ error: `state failed: ${err.message}` });
+        }
+    });
+
+    app.get('/timeline', (req, res) => {
+        const hours = Number(req.query.hours || 6);
+        const limit = Number(req.query.limit || 500);
+        const kinds = req.query.kinds
+            ? String(req.query.kinds).split(',').map((k) => k.trim()).filter(Boolean)
+            : null;
+        try {
+            res.json(sampler.timeline({ hours, kinds, limit }));
+        } catch (err) {
+            res.status(500).json({ error: `timeline failed: ${err.message}` });
+        }
+    });
+
+    app.get('/events/since', (req, res) => {
+        try {
+            res.json(sampler.since(req.query.cursor));
+        } catch (err) {
+            res.status(500).json({ error: `events/since failed: ${err.message}` });
+        }
+    });
+
+    app.get('/apps', (req, res) => {
+        const days = req.query.days === undefined ? null : Number(req.query.days);
+        try {
+            res.json(sampler.apps({ days }));
+        } catch (err) {
+            res.status(500).json({ error: `apps failed: ${err.message}` });
+        }
+    });
+
+    // GET, not DELETE: the CLI is curl based and the token is the boundary. Still the only
+    // destructive endpoint in the surface, so it is listed in PRIVATE_PATHS too.
+    app.get('/history/purge', (req, res) => {
+        const days = req.query.days === undefined ? null : Number(req.query.days);
+        try {
+            const result = sampler.purge({ days });
+            console.log(`[HISTORY PRUNE] removed ${result.removedCount} file(s), kept ${result.kept}`);
+            res.json(result);
+        } catch (err) {
+            res.status(500).json({ error: `purge failed: ${err.message}` });
+        }
     });
 
     return function cleanup() {

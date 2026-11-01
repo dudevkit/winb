@@ -2,7 +2,10 @@
 # Local smoke test for the server pair, without a Windows host.
 #
 # Boots api.js/server.js on a temporary port against a temporary root and drives
-# the OS-agnostic surface: auth, /health, /manifest, fs.*, sessions, /reload.
+# the OS-agnostic surface: auth, /health, /manifest, fs.*, sessions, /reload, and the
+# v1.4 host-context endpoints (/state, /timeline, /events/since, /apps, /history/purge).
+# The sampler runs here too: on a POSIX host it degrades to node-level resource samples,
+# which is exactly the fallback path worth covering without Windows.
 # Exec testing needs cmd.exe/PowerShell, so it is deliberately out of scope.
 #
 # It exists because the ported code has host-dependent paths: the allowed-root
@@ -56,12 +59,14 @@ status_of() { # status_of <url> [auth-header-value]
 
 echo "== preparing ($ROOT)"
 mkdir -p "$SRV" "$DATA/scratch"
-cp "$HERE/winb-server/api.js" "$HERE/winb-server/server.js" "$HERE/winb-server/package.json" "$SRV/"
+cp "$HERE/winb-server/api.js" "$HERE/winb-server/server.js" "$HERE/winb-server/package.json" \
+    "$HERE/winb-server/sampler.js" "$HERE/winb-server/sampler-probe.ps1" "$SRV/"
 ( cd "$SRV" && npm install --silent --no-audit --no-fund >/dev/null 2>&1 ) || {
     echo "npm install failed - is npm on PATH?"; exit 2; }
 
 WINB_PORT="$PORT" WINB_TOKEN="$TOKEN" WINB_DEFAULT_CWD="$DATA/scratch" \
-    WINB_ALLOWED_ROOTS="$DATA" node "$SRV/server.js" >"$ROOT/run.log" 2>&1 &
+    WINB_ALLOWED_ROOTS="$DATA" WINB_HISTORY_DIR="$ROOT/history" WINB_SAMPLE_SEC=5 \
+    node "$SRV/server.js" >"$ROOT/run.log" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 40); do
@@ -71,7 +76,7 @@ done
 
 echo "== checks"
 check "1  /health is public"            '"status":"ok"'      "$(api GET /health '' no)"
-check "2  version reported"             '"version":"1.3.0"'  "$(api GET /health '' no)"
+check "2  version reported"             '"version":"1.4.0"'  "$(api GET /health '' no)"
 check "3  token accepted"                '"defaultCwd"'      "$(api GET /manifest)"
 check "4  /manifest lists caps"          '"fs.write"'        "$(api GET /manifest)"
 check "5  allowed roots from env"        "$DATA"             "$(api GET /manifest)"
@@ -103,6 +108,33 @@ check "18 session round trip"           'smoke'             "$(api POST /session
 check "19 session delete"               'deleted'           "$(api DELETE /session/smoke)"
 check "20 /reload keeps the API alive"  '"status":"reloaded"' "$(api GET /reload)"
 check "21 /health after reload"         '"status":"ok"'      "$(api GET /health '' no)"
+
+# ---- v1.4 host context. /state, /timeline, /events/since, /apps and /history/purge are
+# private: they describe who uses the host, so they need the token even from loopback.
+echo "== host context (v1.4)"
+check "22 /state refuses loopback without token" '401' "$(status_of "http://127.0.0.1:$PORT/state")"
+check "23 /state with token"            '"tracking"'        "$(api GET /state)"
+check "24 /state reports the platform"  '"platform":"'       "$(api GET /state)"
+check "25 /health carries a state line" '"state":{"tracking"' "$(api GET /health '' no)"
+check "26 /manifest tracking block"     '"appRetentionDays"' "$(api GET /manifest)"
+check "27 capabilities include state"   '"state"'            "$(api GET /manifest)"
+check "28 /apps shape"                  '"titlesIncluded"'   "$(api GET /apps)"
+check "29 /events/since baseline"       '"baseline":true'     "$(api GET /events/since)"
+check "30 /history/purge reports window" '"keepDays":7'       "$(api GET '/history/purge?days=7')"
+
+# the sampler needs one interval (WINB_SAMPLE_SEC=5) before there is anything to read
+sleep 7
+check "31 timeline has resource samples" '"kind":"res.sample"' "$(api GET '/timeline?hours=1&kinds=res.sample&limit=5')"
+check "32 timeline reports its source"   '"source"'            "$(api GET '/timeline?hours=1&kinds=res.sample&limit=5')"
+CURSOR="$(api GET /events/since | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])' 2>/dev/null)"
+check "33 /events/since advances cursor" '"count"'             "$(api GET "/events/since?cursor=$CURSOR")"
+check "34 history file written"          'state-'             "$(ls "$ROOT/history" 2>/dev/null)"
+check "35 sampler logged its start"      'sampler.state'      "$(api GET '/timeline?hours=1&kinds=sampler.state')"
+
+# A restart must not re-append event-log rows that history already holds: the dedupe seed has to
+# cover the whole 168 h sweep window, not just the newest few daily files.
+check "36 restart does not re-append events" '[PASS]' \
+    "$(WINB_TEST_SERVER_DIR="$SRV" node "$HERE/tests/test_event_dedupe.js" 2>&1)"
 
 echo
 echo "$PASS passed, $FAIL failed"

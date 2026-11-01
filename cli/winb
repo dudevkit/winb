@@ -22,6 +22,7 @@ remote bytes exactly.
 """
 
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -93,6 +94,15 @@ Sessions, files, processes (typed endpoints, server v1.3+)
   winb ps [filter] [--limit N]              process list with memory
   winb api <METHOD> <path> [json]           raw typed request
 
+Host context (server v1.4+)
+  winb state [--full] [--json]              power, session, disks, net, resources, apps, tracking
+  winb timeline [--hours N] [--kinds LIST] [--limit N] [--json]
+                                            what happened on the host (event timeline)
+  winb apps [--days N] [--json]             per-app usage: minutes, runs, last used
+  winb context [--hours N] [--json]         what changed since this gateway last looked
+  winb privacy [--json]                     exactly what is collected, read from the server
+  winb history purge [--days N]             drop timeline history beyond N days (0 = all)
+
 Jobs and info
   -b, --background         start detached, return immediately
   -id, --process-id <id>   name for the background process
@@ -117,6 +127,7 @@ Environment
   WINB_URL / WINB_HOST+WINB_PORT   server address (default http://127.0.0.1:5110)
   WINB_TOKEN_FILE / WINB_TOKEN     bearer token (also ~/.winb-token, /etc/winb-token)
   WINB_SOCKS                       proxy for the transport, e.g. socks5h://127.0.0.1:1055
+  WINB_CURSOR_FILE                 cursor for `winb context` (default ~/.winb-cursor)
   WINB_DEFAULT_CWD                 remote working directory for file verbs
   WINB_SSH_TARGET / WINB_SSH_KEY   enable --admin (user@host + private key)
   WINB_SHARE_MOUNT                 local mount of the host's SMB share, for `doctor`
@@ -792,6 +803,289 @@ def cmd_doctor(server=None):
 
 # ---------------------------------------------------------------- main
 
+# ---------------------------------------------------------------- host context (v1.4)
+
+CURSOR_FILE = os.environ.get("WINB_CURSOR_FILE") or os.path.expanduser("~/.winb-cursor")
+
+
+def _parse_iso(iso):
+    try:
+        stamp = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+    return stamp
+
+
+def _ago(iso):
+    """Compact age of an ISO timestamp, in the reader's timezone."""
+    stamp = _parse_iso(iso)
+    if stamp is None:
+        return "?"
+    delta = (datetime.datetime.now(datetime.timezone.utc) - stamp).total_seconds()
+    if delta < 0:
+        return "just now"
+    if delta < 90:
+        return f"{int(delta)}s ago"
+    if delta < 5400:
+        return f"{int(delta // 60)}m ago"
+    if delta < 172800:
+        return f"{delta / 3600:.1f}h ago"
+    return f"{delta / 86400:.1f}d ago"
+
+
+def _clock(iso):
+    stamp = _parse_iso(iso)
+    return stamp.astimezone().strftime("%m-%d %H:%M:%S") if stamp else (str(iso) if iso else "?")
+
+
+def _servers_arg(args, server):
+    for arg in args:
+        if arg.startswith("--server="):
+            return arg.split("=", 1)[1]
+    return server
+
+
+def _flag_value(args, name, default=None):
+    for i, arg in enumerate(args):
+        if arg == name and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return default
+
+
+def _event_detail(kind, data):
+    if kind == "app.switch":
+        detail = data.get("app", "?")
+        if data.get("title"):
+            detail += f'   "{data["title"][:70]}"'
+        return detail
+    if kind == "app.usage":
+        return f"{data.get('app', '?')} for {data.get('sec', 0)}s"
+    if kind == "res.sample":
+        parts = []
+        if data.get("memUsedMb"):
+            parts.append(f"mem {data['memUsedMb']} MB")
+        if data.get("procCount"):
+            parts.append(f"{data['procCount']} procs")
+        top = ", ".join(f"{t.get('name')} {t.get('cpuSec')}s" for t in (data.get("cpuTop") or [])[:3])
+        if top:
+            parts.append(f"top cpu: {top}")
+        return " | ".join(parts) or "sample"
+    if kind in ("power.boot", "power.shutdown"):
+        detail = data.get("bootTime") or data.get("at") or ""
+        if data.get("clean") is False:
+            detail += "  UNEXPECTED SHUTDOWN"
+        if data.get("actor"):
+            detail += f"  by {str(data['actor'])[:50]}"
+        return detail.strip() or "planner"
+    if kind == "session.change":
+        return f"{data.get('user') or '?'} {data.get('state')} (idle {data.get('idleSec')}s){' locked' if data.get('locked') else ''}"
+    if kind == "disk.change":
+        if data.get("appeared"):
+            return f"{data.get('drive')} appeared: {data.get('freeGb')} GB free ({data.get('pct')}%)"
+        if data.get("disappeared"):
+            return f"{data.get('drive')} disappeared"
+        return f"{data.get('drive')} below {data.get('threshold')}%: {data.get('freeGb')} GB free ({data.get('pct')}%)"
+    if kind == "net.change":
+        return " | ".join(f"{a.get('iface')} {a.get('state')} {a.get('address') or '-'}"
+                          for a in (data.get("adapters") or [])) or "adapter set changed"
+    if kind == "app.crash":
+        return f"event {data.get('id')}: {str(data.get('msg') or '')[:70]}"
+    if kind == "bridge.reload":
+        return f"server v{data.get('version')} pid {data.get('pid')}"
+    if kind == "sampler.state":
+        return f"{data.get('state')} {data.get('reason') or ''}".strip()
+    return json.dumps(data)[:110]
+
+
+def cmd_state(args, server=None):
+    server = _servers_arg(args, server)
+    data = api_call("GET", "/state", server=server, timeout=30)
+    if "--json" in args:
+        print(json.dumps(data, indent=2))
+        return 0
+    host, power, session = data.get("host", {}), data.get("power", {}), data.get("session", {})
+    res, apps, track = data.get("res", {}), data.get("apps", {}), data.get("tracking", {})
+    mem = f"{res.get('memUsedMb')}/{host.get('memTotalMb')} MB" if res.get("memUsedMb") else "-"
+    print(f"host      {host.get('name')}  {host.get('platform')}  {host.get('cpus')} cpu")
+    print(f"power     boot {_clock(power.get('bootTime'))} ({_ago(power.get('bootTime'))}), uptime {power.get('uptimeSec', 0) / 3600:.1f} h")
+    idle = session.get("idleSec")
+    print(f"session   {session.get('user') or '-'}  {session.get('state')}"
+          f"{'  locked' if session.get('locked') else ''}  idle {idle if idle is not None else '?'}s  {session.get('name') or '-'}")
+    print(f"res       mem {mem}   procs {res.get('procCount') if res.get('procCount') else '-'}")
+    if data.get("disk"):
+        print("disk      " + " | ".join(f"{d.get('drive')} {d.get('freeGb')}G free ({d.get('pct')}%)" for d in data["disk"]))
+    if data.get("net"):
+        print("net       " + " | ".join(f"{n.get('iface')} {n.get('state')} {n.get('speedMbps')}Mbps {n.get('address') or '-'}" for n in data["net"]))
+    active = apps.get("active")
+    if active:
+        print(f"apps      foreground {active.get('app')} ({active.get('durSec', 0) / 60:.1f} min)"
+              + (f'  "{active.get("title")}"' if active.get("title") else ""))
+    if res.get("cpuTop"):
+        print("cpu top   " + " | ".join(f"{t.get('name')} {t.get('cpuSec')}s ({t.get('wsMb')} MB)" for t in res["cpuTop"]))
+    print(f"tracking  {'on' if track.get('enabled') and track.get('sampling') else 'off'}"
+          f"  titles {'on' if track.get('titles') else 'off'}"
+          f"{' (live-only)' if track.get('titles') and not track.get('titlesPersist') else ''}"
+          f"  history {'off' if not track.get('history') else str(track.get('retentionDays')) + 'd'}"
+          f"  sample {track.get('sampleSec')}s"
+          + (f"  DEGRADED: {track['degraded'].get('reason')}" if track.get("degraded") else ""))
+    if "--full" in args:
+        if apps.get("windows"):
+            print("\nwindows:")
+            for w in apps["windows"]:
+                print(f"  {w.get('app'):<24} {w.get('cpuSec') or 0:>9}s  {str(w.get('title') or '')[:70]}")
+        if apps.get("recent"):
+            print("\nrecent foreground:")
+            for r in apps["recent"][-15:]:
+                print(f"  {_clock(r.get('t'))}  {r.get('app'):<22} {str(r.get('title') or '')[:60]}")
+    return 0
+
+
+def cmd_timeline(args, server=None):
+    server = _servers_arg(args, server)
+    hours = _flag_value(args, "--hours", 6)
+    limit = _flag_value(args, "--limit", 60)
+    kinds = _flag_value(args, "--kinds")
+    query = f"?hours={hours}&limit={limit}" + (f"&kinds={kinds}" if kinds else "")
+    data = api_call("GET", "/timeline" + query, server=server, timeout=60)
+    if "--json" in args:
+        print(json.dumps(data, indent=2))
+        return 0
+    events = data.get("events", [])
+    print(f"{data.get('count')} event(s) in the last {data.get('hours')}h ({data.get('source')})")
+    if not events:
+        print("  nothing recorded: either the window is quiet, WINB_HISTORY=0, or the sampler is off")
+        return 0
+    for event in events:
+        print("  " + f"{_clock(event.get('t'))}  {event.get('kind'):<18} {_event_detail(event.get('kind'), event.get('data') or {})}")
+    return 0
+
+
+def cmd_apps(args, server=None):
+    server = _servers_arg(args, server)
+    days = _flag_value(args, "--days")
+    data = api_call("GET", "/apps" + (f"?days={days}" if days else ""), server=server, timeout=60)
+    if "--json" in args:
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"app usage, last {data.get('days')} day(s): {data.get('count')} app(s)")
+    if not data.get("apps"):
+        print("  no rows yet. Usage needs the sampler to observe a foreground app change")
+        print("  (Windows host, WINB_TRACK=on). UserAssist history is not part of this view.")
+        return 0
+    print(f"  {'minutes':>8}  {'runs':>5}  {'last used':<18} app")
+    for app in data["apps"]:
+        mark = " *" if app.get("active") else ""
+        print(f"  {app.get('minutes', 0):>8.1f}  {app.get('runs', 0):>5}  "
+              f"{_clock(app.get('lastUsed')):<18} {app.get('app')}{mark}")
+    print("  * currently in the foreground" if any(a.get("active") for a in data["apps"]) else "")
+    if data.get("note"):
+        print(f"  note: {data['note']}")
+    return 0
+
+
+def cmd_context(args, server=None):
+    """Delta since this gateway last looked, plus what is running there."""
+    server = _servers_arg(args, server)
+    as_json = "--json" in args
+    hours = _flag_value(args, "--hours", 24)
+    cursor = ""
+    try:
+        with open(CURSOR_FILE, "r", encoding="utf-8") as fh:
+            cursor = fh.read().strip()
+    except OSError:
+        cursor = ""
+    since = api_call("GET", "/events/since" + (f"?cursor={cursor}" if cursor else ""), server=server, timeout=60)
+    events = since.get("events", [])
+    keep = [e for e in events if (_parse_iso(e.get("t")) or datetime.datetime.now(datetime.timezone.utc))
+            >= datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=float(hours))]
+    jobs = []
+    try:
+        jobs = api_call("GET", "/list", server=server, timeout=30).get("processes", [])
+    except WinbError:
+        jobs = []
+    running = [j for j in jobs if j.get("status") == "running"]
+    state = {}
+    try:
+        state = api_call("GET", "/state", server=server, timeout=30)
+    except WinbError:
+        state = {}
+    if as_json:
+        print(json.dumps({"newEvents": len(keep), "events": keep, "runningJobs": running,
+                          "session": (state.get("session") or {}), "cursor": since.get("cursor")}, indent=2))
+    else:
+        if since.get("baseline"):
+            print("first call from this gateway: baseline recorded, nothing to report yet")
+        elif since.get("reset"):
+            print("history was rotated or purged since the last call: cursor re-baselined")
+        else:
+            print(f"{len(keep)} new event(s) since this gateway last looked"
+                  + (f", {len(events) - len(keep)} older than {hours}h" if len(events) > len(keep) else ""))
+            for event in sorted(keep, key=lambda e: e.get("t") or ""):
+                print("  " + f"{_clock(event.get('t'))}  {event.get('kind'):<18} {_event_detail(event.get('kind'), event.get('data') or {})}")
+            if not keep:
+                print("  host was quiet: no state changes recorded")
+        session = state.get("session") or {}
+        idle = session.get("idleSec")
+        print(f"session   {session.get('state', '?')}  idle {idle if idle is not None else '?'}s"
+              f"{'  locked' if session.get('locked') else ''}")
+        print(f"jobs      {len(running)} running" + (": " + ", ".join(j.get('processId', '?') for j in running) if running else ""))
+    try:
+        with open(CURSOR_FILE, "w", encoding="utf-8") as fh:
+            fh.write(since.get("cursor") or "")
+        os.chmod(CURSOR_FILE, 0o600)
+    except OSError as exc:
+        print(f"warning: could not save cursor to {CURSOR_FILE}: {exc}", file=sys.stderr)
+    return 0
+
+
+def cmd_privacy(args, server=None):
+    server = _servers_arg(args, server)
+    manifest = api_call("GET", "/manifest", server=server, timeout=30)
+    track = manifest.get("tracking", {})
+    if "--json" in args:
+        print(json.dumps(track, indent=2))
+        return 0
+    print("what this host reports about its own use:")
+    print(f"  tracking      {'enabled' if track.get('enabled') else 'disabled'} (WINB_TRACK)")
+    print(f"  sampling      every {track.get('sampleSec')}s" if track.get("sampling") else "  sampling      not running")
+    print("  app usage     executable name + duration (WINB_TITLES does not affect this)")
+    if track.get("titles") and not track.get("titlesPersist"):
+        print("  window titles captured live only, never written to disk")
+    elif track.get("titles"):
+        print("  window titles captured and persisted (WINB_TITLES_PERSIST=1)")
+    else:
+        print("  window titles not captured (WINB_TITLES=off)")
+    history = f"{track.get('historyDir')} ({track.get('retentionDays')}d raw)" if track.get("history") else "off"
+    print(f"  history       {history}")
+    print("  never         keystrokes, screenshots, clipboard, file or message contents")
+    print("  transport     nothing leaves the host except responses to token holders")
+    if track.get("degraded"):
+        print(f"  degraded      {track['degraded'].get('reason')}")
+    return 0
+
+
+def cmd_history(args, server=None):
+    server = _servers_arg(args, server)
+    if not args or args[0] in ("-h", "--help"):
+        print("usage: winb history purge [--days N]     (0 = delete everything)")
+        return 0
+    if args[0] != "purge":
+        die(f"unknown history action {args[0]!r}; the only action is 'purge'")
+    days = _flag_value(args, "--days")
+    query = f"?days={days}" if days is not None else ""
+    data = api_call("GET", "/history/purge" + query, server=server, timeout=120)
+    print(f"purged {data.get('removedCount')} file(s), kept {data.get('kept')} (window {data.get('keepDays')} day(s))")
+    for name in data.get("removed", []):
+        print(f"  removed {name}")
+    if data.get("prunedBySize"):
+        print(f"  pruned by size cap: {', '.join(data['prunedBySize'])}")
+    return 0
+
+
 def parse(argv):
     """Hand-rolled parser mirroring v1: flags anywhere, everything else is the command."""
     opts = {"command_parts": []}
@@ -855,7 +1149,8 @@ def main():
     argv = sys.argv[1:]
 
     if argv and argv[0] in ("put", "get", "doctor", "ls", "stat", "read", "cat", "rm", "ps",
-                            "session", "api", "write"):
+                            "session", "api", "write", "state", "timeline", "apps", "context",
+                            "privacy", "history"):
         sub = argv[0]
         rest = argv[1:]
         server = None
@@ -891,6 +1186,18 @@ def main():
                 die('usage: winb api <METHOD> <path> [json-body]')
             sys.exit(cmd_api(positional[0], positional[1], positional[2] if len(positional) > 2 else None,
                              server=server))
+        if sub == "state":
+            sys.exit(cmd_state(rest, server=server))
+        if sub == "timeline":
+            sys.exit(cmd_timeline(rest, server=server))
+        if sub == "apps":
+            sys.exit(cmd_apps(rest, server=server))
+        if sub == "context":
+            sys.exit(cmd_context(rest, server=server))
+        if sub == "privacy":
+            sys.exit(cmd_privacy(rest, server=server))
+        if sub == "history":
+            sys.exit(cmd_history(rest, server=server))
 
     opts = parse(argv)
     if opts.get("help"):

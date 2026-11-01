@@ -13,5 +13,9 @@ Thumbs.db
 .token
 sessions.json
 jobs.json
+history/
+server-env.ps1
 *.bak
 node_modules/
+__pycache__/
+*.pyc

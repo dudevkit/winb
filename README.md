@@ -6,14 +6,19 @@ Hybrid Windows remote execution bridge for Hermes Agent.
 
 **v1.3** adds bearer-token auth for LAN callers, typed `fs.*` / `proc.*` endpoints, sticky sessions, a 64 mb body limit, and a rewritten single-process CLI (0.33 s per round trip versus 2.84 s in v1). See [docs/winb-v1.3.md](docs/winb-v1.3.md) for the full surface and [docs/AUDIT-2026-11-01.md](docs/AUDIT-2026-11-01.md) for the measurements behind it.
 
+**v1.4** adds host context: a sampler inside the server keeps `GET /state` (power, session, disks, network, resources, foreground app) and an event timeline (`GET /timeline`, `GET /apps`) that says what happened on the host and who used it. See [docs/winb-v1.4-spec.md](docs/winb-v1.4-spec.md).
+
 ## Layout
 
 ```
 winb-server/          # Node.js Express server (runs on Windows)
   server.js           # entrypoint: auth, body limit, log rotation, port from WINB_PORT
   api.js              # HTTP API surface (hot-reloadable via GET /reload)
+  sampler.js          # host context sampler: /state, timeline, app-usage rollups
+  sampler-probe.ps1   # probe helper driven by sampler.js (one long-lived process)
   winb-tray.ps1       # system-tray launcher + hard restart + watchdog owner
-  watchdog.ps1        # polls /health every 15 s, respawns node
+  watchdog.ps1        # polls /health every 15 s, respawns node, recovers a hung listener
+  server-env.example.ps1  # template for server-env.ps1 (deployment settings, gitignored)
   start-winb.vbs      # silent tray bootstrap
   tail-log.ps1        # live log tail
   tunnel-only/        # same api.js, separate bootstrap + deploy guide for a host
@@ -33,6 +38,7 @@ docs/
   winb-execution.md                   # operating the bridge from a gateway (mount, paths, elevation, traps)
   windows-remote-execution-bridge.md  # the hybrid layout: SMB mount + HTTP execution, tray autostart
   AUDIT-2026-11-01.md                 # usage audit + acceptance list for the v1.3 work
+  winb-v1.4-spec.md                   # v1.4 proposal: host state, event timeline, app usage (draft)
 ```
 
 ## Features
@@ -45,7 +51,9 @@ docs/
 - Background process registry + kill, with persisted job records
 - Bearer-token auth (`Authorization: Bearer <token>`), loopback trusted, `/ping` and `/health` public
 - Output cap with spill-to-file, log rotation, device manifest (`GET /manifest`)
-- Tray app with View Logs / Hard Restart / Exit, plus a watchdog
+- Tray app with View Logs / Hard Restart / Exit, plus a watchdog that also recovers a hung listener
+- Host context: `GET /state` (power, session, disks, network, resources, foreground app), `GET /timeline`
+  (event log: boots, shutdowns, network and disk transitions, app switches), `GET /apps` (per-app minutes)
 - CLI: env-based host, sessions, `--out`, `--cmd-file`, `--stdin-file`, `--json`, optional SOCKS
 
 ## Quick start (Windows server)
@@ -119,6 +127,19 @@ Left unset, the CLI talks to `http://127.0.0.1:5110` — the tunnel/port-forward
 | `WINB_SOCKS` | client | transport proxy, e.g. `socks5h://127.0.0.1:1055` |
 | `WINB_DEFAULT_CWD` | client | default remote directory for file verbs |
 | `WINB_SSH_TARGET`, `WINB_SSH_KEY` | client | enable `--admin` (user@host + key) |
+| `WINB_TRACK` | server | master switch for the sampler (default on) |
+| `WINB_TITLES`, `WINB_TITLES_PERSIST` | server | window titles: live only (default) versus written to history |
+| `WINB_SAMPLE_SEC` | server | sampler interval (default 60) |
+| `WINB_HISTORY`, `WINB_HISTORY_DAYS`, `WINB_HISTORY_MAX_MB` | server | timeline file, retention, size cap |
+| `WINB_APP_DAYS` | server | app-usage rollup retention (default 90) |
+| `WINB_HISTORY_DIR` | server | where `history/*.jsonl` lives (default `<server folder>\history`) |
+| `WINB_PRIVATE_API` | server | require the token for `/state` and friends even on loopback (default on) |
+| `WINB_CURSOR_FILE` | client | cursor for `winb context` (default `~/.winb-cursor`) |
+
+Deployment settings usually live in **`server-env.ps1`** next to `server.js` rather than in the
+shell: `winb-tray.ps1` and `watchdog.ps1` dot-source it before spawning node, so a manual start and
+an automatic respawn end up with the same configuration. Copy `server-env.example.ps1` and edit it;
+the real file is gitignored.
 
 ## API sketch
 
@@ -133,6 +154,14 @@ Left unset, the CLI talks to `http://127.0.0.1:5110` — the tunnel/port-forward
 | GET/POST/DELETE | `/fs/stat`, `/fs/list`, `/fs/read`, `/fs/write`, `/fs/mkdir`, `/fs/move`, `/fs/rm` | see [docs/winb-v1.3.md](docs/winb-v1.3.md) | typed file ops |
 | GET/POST | `/proc/list`, `/proc/kill` | `?filter=&limit=` / `{pid\|name, tree}` | process ops |
 | GET/POST/DELETE | `/session[/:id]` | `{workdir?, env?}` | sticky workdir + env |
+| GET | `/state` | `?detail=full` | host context: power, session, disks, network, resources, apps, tracking |
+| GET | `/timeline` | `?hours=6&kinds=power,net,app&limit=500` | event timeline (memory ring + `history/*.jsonl`) |
+| GET | `/events/since` | `?cursor=<opaque>` | events after a cursor, so a caller can ask for "what is new" |
+| GET | `/apps` | `?days=7` | per-app minutes, runs, last used |
+| GET | `/history/purge` | `?days=0` | drop timeline history beyond N days (0 = everything) |
+
+`/state`, `/timeline`, `/events/since`, `/apps` and `/history/purge` describe who uses the host, so
+they require the bearer token **even from loopback** while `WINB_PRIVATE_API` is on (default).
 
 Full request/response shapes: [docs/winb-v1.3.md](docs/winb-v1.3.md).
 
@@ -146,6 +175,7 @@ export WINB_TOKEN_FILE=~/.winb-token
 python3 tests/verify_client.py      # 17 checks
 python3 tests/verify_phase2.py      # 13 checks
 python3 tests/verify_phase3.py      # 12 checks
+python3 tests/verify_phase4.py      # 18 checks (needs server v1.4: host context surface)
 ```
 
 Each suite prints `PASS`/`FAIL` per check and exits non-zero on failure. Run all three after touching `server.js`, `api.js` or `cli/winb`.
@@ -153,8 +183,11 @@ Each suite prints `PASS`/`FAIL` per check and exits non-zero on failure. Run all
 No Windows host at hand? `tests/smoke_local.sh` boots the server pair on a temp port against a temp root and drives the OS-agnostic surface (auth, `/health`, `/manifest`, `fs.*`, sessions, `/reload`) — 21 checks, no Windows required:
 
 ```bash
-tests/smoke_local.sh                 # needs node + npm + curl
+tests/smoke_local.sh                 # 35 checks, needs node + npm + curl
 ```
+
+`verify_phase4.py` is non-destructive by default - the purge check keeps the retention window. Set
+`WINB_TEST_PURGE=1` to also run the full wipe (`days=0`), which empties the timeline.
 
 Exec paths (`cmd.exe`, PowerShell) are out of its scope by design.
 
@@ -162,7 +195,10 @@ Exec paths (`cmd.exe`, PowerShell) are out of its scope by design.
 
 - Bind is `0.0.0.0`; the token is the LAN boundary. Loopback is always trusted so local watchdogs keep working.
 - Writes, moves and deletes are confined to `WINB_ALLOWED_ROOTS`; reads are not restricted.
-- Never commit `.token`, `sessions.json` or `jobs.json` (see `.gitignore`).
+- Never commit `.token`, `sessions.json`, `jobs.json`, `history/` or `server-env.ps1` (see `.gitignore`).
+- Host context is the privacy-sensitive surface: window titles stay in memory unless
+  `WINB_TITLES_PERSIST=1`, keystrokes/screenshots/clipboard/file contents are never collected, and
+  `history/` is ACL-restricted to the account running the server.
 - Hosts that cannot be reached inbound: use the reverse-tunnel profile (`cli/winb-tunnel` + `winb-server/tunnel-only/`). The loopback endpoint is then the boundary, and the token covers the case where the port becomes reachable another way.
 
 ## Related Hermes skills

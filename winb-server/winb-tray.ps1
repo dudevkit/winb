@@ -5,7 +5,21 @@ Add-Type -AssemblyName System.Drawing
 $workDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $workDir
 $logFile = Join-Path $workDir "server.log"
+$ownerFile = Join-Path $workDir "watchdog.owner"
+$envFile = Join-Path $workDir "server-env.ps1"
 $script:proc = $null
+
+# Deployment settings (WINB_PORT, WINB_DEFAULT_CWD, WINB_ALLOWED_ROOTS, WINB_TRACK, ...) live in
+# server-env.ps1 next to this script. Both the tray and the watchdog load it before spawning
+# node, so a manually started server and a respawned one end up with identical settings.
+function Import-ServerEnv {
+    if (Test-Path $envFile) { . $envFile }
+}
+
+function Get-ServerPort {
+    if ($env:WINB_PORT) { return [int]$env:WINB_PORT }
+    return 5110
+}
 
 function Write-LogSep([string]$msg) {
     Add-Content -Path $logFile -Value "============================================"
@@ -14,6 +28,7 @@ function Write-LogSep([string]$msg) {
 }
 
 function Start-WinbNode {
+    Import-ServerEnv
     $procInfo = New-Object System.Diagnostics.ProcessStartInfo
     $procInfo.FileName = "cmd.exe"
     $procInfo.Arguments = "/c node server.js >> server.log 2>&1"
@@ -31,6 +46,17 @@ function Stop-WinbTree {
         try { Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue } catch {}
     }
     $script:proc = $null
+}
+
+# Watchdog: respawns node when it dies while nobody is watching. Idempotent - only one runs.
+function Start-Watchdog {
+    Set-Content -Path $ownerFile -Value $PID
+    $script:watchdog = Join-Path $workDir "watchdog.ps1"
+    if (-not (Test-Path $script:watchdog)) { return }
+    $existing = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -like "*watchdog.ps1*" }
+    if ($existing) { return }
+    Start-Process powershell -WindowStyle Hidden -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$script:watchdog`""
 }
 
 # Check Node
@@ -59,16 +85,17 @@ if (-not (Test-Path (Join-Path $workDir "node_modules"))) {
 # If server already answering on 5110, do not start a second Node (avoid EADDRINUSE / dual tray chaos)
 $alreadyUp = $false
 try {
-    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:5110/ping" -UseBasicParsing -TimeoutSec 2
+    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$(Get-ServerPort)/ping" -UseBasicParsing -TimeoutSec 2
     if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) { $alreadyUp = $true }
 } catch { $alreadyUp = $false }
 
 if ($alreadyUp) {
-    Write-LogSep "WinB tray attached; server already up on :5110 at $(Get-Date) dir=$workDir"
+    Write-LogSep "WinB tray attached; server already up on :$(Get-ServerPort) at $(Get-Date) dir=$workDir"
 } else {
     Write-LogSep "Winb Server Started at $(Get-Date)  dir=$workDir"
     $script:proc = Start-WinbNode
 }
+Start-Watchdog
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-Process -Id $PID).Path)
@@ -97,7 +124,7 @@ $menuRestart.add_Click({
         Stop-WinbTree
         # Also free port 5110 if a stray node from a previous tray still holds it
         try {
-            $conns = Get-NetTCPConnection -LocalPort 5110 -State Listen -ErrorAction SilentlyContinue
+            $conns = Get-NetTCPConnection -LocalPort (Get-ServerPort) -State Listen -ErrorAction SilentlyContinue
             foreach ($c in $conns) {
                 if ($c.OwningProcess) {
                     Start-Process -FilePath "taskkill.exe" -ArgumentList "/PID",$c.OwningProcess,"/T","/F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
@@ -106,6 +133,7 @@ $menuRestart.add_Click({
         } catch {}
         Write-LogSep "Winb Server (HARD RESTART) at $(Get-Date)"
         $script:proc = Start-WinbNode
+        Start-Watchdog
     }
 })
 
@@ -113,6 +141,8 @@ $menuExit = New-Object System.Windows.Forms.MenuItem
 $menuExit.Text = "Exit WinB Server"
 $menuExit.add_Click({
     Stop-WinbTree
+    # Removing the owner file is what tells the watchdog to stop with us
+    Remove-Item -Path $ownerFile -Force -ErrorAction SilentlyContinue
     $notifyIcon.Visible = $false
     [System.Windows.Forms.Application]::Exit()
 })
