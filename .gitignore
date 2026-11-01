@@ -17,3 +17,5 @@ history/
 server-env.ps1
 *.bak
 node_modules/
+__pycache__/
+*.pyc
