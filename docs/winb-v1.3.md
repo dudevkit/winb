@@ -13,7 +13,7 @@ Written against winb-server **1.3.0** and CLI **2.0.0**. Measurements and reprod
 | Server routes | `winb-server\api.js` (hot-reloadable) |
 | Server bootstrap | `winb-server\server.js` (auth, 64 mb body limit, version) |
 | Token | host `winb-server/.token`, gateway `~/.winb-token` |
-| Tunnel-only host | `cli/winb-office` (wrapper) + `winb-server/office/` (bootstrap + deploy notes) |
+| Tunnel-only host | `cli/winb-tunnel` (wrapper) + `winb-server/tunnel-only/` (bootstrap + deploy guide) |
 | Watchdog | `watchdog.ps1`, owned by `winb-tray.ps1`, polls `/health` every 15 s |
 
 `winb "echo hi"` costs **0.33 s** end to end (v1 was 2.84 s; the server answers in 131 ms).
@@ -73,17 +73,23 @@ with a spill path in `%TEMP%`, `<scratch dir>` as the default cwd, 64 mb body li
 job records persisted, `server.log` rotated, `routes.js` deleted (dead code - its routes were
 duplicated in `api.js`).
 
-## 4. Office PC (winb-office)
+## 4. Tunnel-only profile (host reachable only through a reverse tunnel)
 
-`cli/winb-office` is a thin wrapper: it exports `WINB_SERVER_URL=http://127.0.0.1:5110`
-(the bastion reverse-tunnel bridge), keeps the `--ping` preflight and its bridge hints, refuses
-`--admin` (that machine has no inbound shell), then execs the shared v2 client. All v1 flags are
-preserved.
+For a machine with no inbound route - no port forward, no VPN, often a network you do not
+administer. The host dials out to a relay you control; the gateway drives it through that tunnel
+and talks to a loopback forwarder.
 
-The office server is still v1.2: the v2 client falls back to its exec/put/get path automatically and
-reports "this server does not expose X - it predates v1.3" for the typed verbs. The upgrade is staged
-in `winb-server/office/` (bootstrap + `APPLY.md` with copy/check/restart/rollback steps); the same
-`api.js` is used, only the bootstrap differs.
+`cli/winb-tunnel` is the gateway-side wrapper: it exports `WINB_SERVER_URL=http://127.0.0.1:5110`,
+keeps a `/ping` preflight so an offline host fails loudly (the hint names the forwarder unit from
+`WINB_BRIDGE_UNIT`), refuses `--admin` because a reverse tunnel offers no inbound shell, and then
+execs the shared v2 client. Every v1 flag is preserved.
+
+`winb-server/tunnel-only/` holds the matching bootstrap (version `1.3.0-tunnel`) - same `api.js`,
+env driven like `server.js`, with its own `/health` identity - plus `README.md` covering the
+topology, the deploy steps and rollback. A remote server that predates v1.3 still works: the client
+falls back to its exec/put/get path for transfers and reports "this server does not expose X - it
+predates v1.3" for the typed verbs. The loopback endpoint is the boundary; the token protects the
+case where the port becomes reachable another way.
 
 ## 5. Server edits, HMR and recovery
 
@@ -130,5 +136,5 @@ respawn.
 * Host-firewall scoping of port 5110 to the gateway IP is often **not** available: the inbound
   allowance typically comes from per-program `Node.js JavaScript Runtime` allow rules
   (Private+Public, any remote), and editing those breaks every other node service on that machine.
-  The token is the boundary; binding to 127.0.0.1 plus an SSH tunnel (the `cli/winb-office` profile)
+  The token is the boundary; binding to 127.0.0.1 plus a reverse tunnel (the `cli/winb-tunnel` profile)
   is the alternative when the host is not on your own network.

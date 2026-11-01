@@ -16,12 +16,12 @@ winb-server/          # Node.js Express server (runs on Windows)
   watchdog.ps1        # polls /health every 15 s, respawns node
   start-winb.vbs      # silent tray bootstrap
   tail-log.ps1        # live log tail
-  office/             # same api.js, different bootstrap + deploy notes for a
-                      # corporate PC reached through a reverse SSH tunnel
+  tunnel-only/        # same api.js, separate bootstrap + deploy guide for a host
+                      # that is reachable only through a reverse tunnel
   INSTALL-SEKALI.bat / START-WINB.bat / CEK-STATUS.bat
 cli/
   winb                # Linux CLI (single Python process, gateway side)
-  winb-office         # thin wrapper: loopback bridge profile, no --admin
+  winb-tunnel         # thin wrapper: loopback bridge / tunnel profile, no --admin
   legacy/winb-v1.sh   # the retired bash+jq client, kept for reference only
 tests/
   smoke_local.sh      # 21 checks, boots the server locally (no Windows host needed)
@@ -162,7 +162,7 @@ Exec paths (`cmd.exe`, PowerShell) are out of its scope by design.
 - Bind is `0.0.0.0`; the token is the LAN boundary. Loopback is always trusted so local watchdogs keep working.
 - Writes, moves and deletes are confined to `WINB_ALLOWED_ROOTS`; reads are not restricted.
 - Never commit `.token`, `sessions.json` or `jobs.json` (see `.gitignore`).
-- Reaching a second machine through a reverse SSH tunnel is the recommended profile when the host is not on your own network — see `winb-server/office/`.
+- Hosts that cannot be reached inbound: use the reverse-tunnel profile (`cli/winb-tunnel` + `winb-server/tunnel-only/`). The loopback endpoint is then the boundary, and the token covers the case where the port becomes reachable another way.
 
 ## Related Hermes skills
 

@@ -1,0 +1,102 @@
+#!/bin/bash
+# winb-tunnel: drive a Windows host that is reachable only through a reverse tunnel.
+#
+# Thin wrapper around the shared `winb` client. The old bash+jq implementation spawned jq
+# six times per call (~2.7 s of overhead); the shared client does a round trip in ~0.33 s
+# and fixes the quoting, stdin, NUL-byte and hang classes.
+#
+# Transport: the remote host holds a reverse SSH tunnel to a relay host you control, and a
+# local forwarder on this machine republishes it on loopback (default 127.0.0.1:5110).
+# The loopback endpoint is the security boundary - never expose the relay's forwarded port
+# publicly. Point WINB_SERVER_URL somewhere else if your topology differs.
+#
+# Deliberately different from the plain `winb` client:
+#   - no --admin route: a reverse tunnel offers no inbound shell, so an SSH fallback would
+#     only fail confusingly. Elevate a process on that host itself instead.
+#   - a /ping preflight so an offline host fails loudly instead of looking like an empty
+#     success, plus a raw --ping check for scripts.
+#   - the remote server may predate v1.3: the shared client degrades to its exec/put/get
+#     path when the typed fs endpoints are missing and says so for the typed verbs.
+#
+# WINB_BRIDGE_UNIT names the local forwarder unit, so the hints below point at the right
+# service on your machine (default: winb-tunnel-bridge.service).
+
+export WINB_SERVER_URL="${WINB_SERVER_URL:-http://127.0.0.1:5110}"
+WINB_CLIENT="${WINB_CLIENT:-winb}"
+BRIDGE_UNIT="${WINB_BRIDGE_UNIT:-winb-tunnel-bridge.service}"
+
+bridge_hint() {
+    echo "       Either the remote host is off or its reverse tunnel is down," >&2
+    echo "       or the local forwarder (${BRIDGE_UNIT}) is not running." >&2
+    echo "       Check: systemctl status ${BRIDGE_UNIT}" >&2
+    echo "       The relay's forwarded port is LISTENING only while the host is up." >&2
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            cat <<'HELP'
+Usage: winb-tunnel [OPTIONS] "command"
+
+Runs a command on a tunnel-only Windows host through the loopback bridge (v2 client).
+
+Transport
+  -w, --workdir <dir>      working directory on the remote host
+  -p, --powershell         run through powershell.exe instead of cmd.exe
+  -t, --timeout <sec>      server-side timeout (kills the process tree)
+  -e, --env KEY=VALUE      extra environment variable (repeatable)
+
+Payload
+  --stdin-file <path>      feed this file to the remote command's stdin
+  --cmd-file <path>        read the command from a file (no shell quoting)
+
+Output
+  --json                   raw server response
+  --out <path>             save stdout to a local file
+
+Jobs and info
+  -b, --background         start detached
+  -id, --process-id <id>   name for the background process
+  -l, --list               list background records
+  --logs <id> [--tail N]   show background logs
+  -k, --kill <id>          kill a background process (tree)
+  --health                 server health
+  --ping                   raw connectivity check against the bridge
+  --port <port>            check a TCP port on that host
+  --open-url <url>         open a URL in that host's browser
+  --manifest               device facts (needs server v1.3+)
+  --version                versions
+  -h, --help               this help
+
+Files / typed ops (v2 client, needs server v1.3+ for the typed endpoints)
+  put <local> <remote>     chunked upload, sha256 verified
+  get <remote> <local>     chunked download, sha256 verified
+  ls | stat | read | rm | ps | session | api
+
+NOT available here: --admin (a tunnel-only host offers no inbound SSH; elevate on that
+machine itself instead).
+HELP
+            exit 0
+            ;;
+        --admin)
+            echo "Error: --admin is not available for a tunnel-only host (reverse tunnel only)." >&2
+            echo "       Elevate a process on that machine directly instead." >&2
+            exit 1
+            ;;
+    esac
+done
+
+if ! curl -s --max-time 15 -o /dev/null "${WINB_SERVER_URL}/ping"; then
+    echo "Error: remote host not reachable via ${WINB_SERVER_URL}" >&2
+    bridge_hint
+    exit 1
+fi
+
+# Raw connectivity check, for scripts that want the payload.
+if [[ "${1:-}" == "--ping" ]]; then
+    curl -s --max-time 15 "${WINB_SERVER_URL}/ping"
+    echo ""
+    exit 0
+fi
+
+exec "$WINB_CLIENT" "$@"
