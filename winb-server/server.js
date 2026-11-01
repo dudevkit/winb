@@ -3,9 +3,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const app = express();
+// Required here and in api.js: the require cache makes both references the same instance,
+// which is what lets GET /reload swap api.js without leaking sampler children or timers.
+const sampler = require('./sampler.js');
 const PORT = Number(process.env.WINB_PORT || 5110);
 const startedAt = new Date();
-const SERVER_VERSION = '1.3.0';
+const SERVER_VERSION = '1.4.0';
 const BODY_LIMIT_MB = Number(process.env.WINB_BODY_LIMIT_MB || 64);
 const TOKEN_FILE = process.env.WINB_TOKEN_FILE || path.join(__dirname, '.token');
 const LOG_FILE = path.join(__dirname, 'server.log');
@@ -32,12 +35,21 @@ function isLoopback(req) {
 }
 
 const PUBLIC_PATHS = new Set(['/ping', '/health']);
+
+// Endpoints that describe who uses this host and what they run. A local process reaches a
+// loopback socket for free, so with WINB_PRIVATE_API on (default) these require the token even
+// from localhost. Turn it off only when a local tool genuinely cannot be handed the token.
+const PRIVATE_PATHS = new Set(['/state', '/timeline', '/events/since', '/apps', '/history/purge']);
+const PRIVATE_API = !['0', 'off', 'false', 'no'].includes(String(process.env.WINB_PRIVATE_API || 'on').toLowerCase());
+
 app.use((req, res, next) => {
-    if (PUBLIC_PATHS.has(req.path) || isLoopback(req)) return next();
+    if (PUBLIC_PATHS.has(req.path)) return next();
     const expected = loadToken();
+    const needsToken = PRIVATE_API && PRIVATE_PATHS.has(req.path);
+    if (!needsToken && isLoopback(req)) return next();
     if (!expected) return next();
     if ((req.get('Authorization') || '') === `Bearer ${expected}`) return next();
-    console.log(`[AUTH] 401 ${req.method} ${req.path} from ${req.socket.remoteAddress}`);
+    console.log(`[AUTH] 401 ${req.method} ${req.path} from ${req.socket.remoteAddress}${needsToken ? ' (private endpoint)' : ''}`);
     return res.status(401).json({ error: 'unauthorized: send Authorization: Bearer <token>' });
 });
 
@@ -89,6 +101,7 @@ app.get('/reload', (req, res) => {
         delete require.cache[require.resolve('./api.js')];
         cleanupApi = require('./api.js')(app, processes, serverState);
         console.log('[HOT RELOAD] API routes updated successfully.');
+        sampler.record({ kind: 'bridge.reload', src: 'bridge', data: { version: SERVER_VERSION, pid: process.pid } });
         res.json({ status: 'reloaded', activeProcesses: processes.size });
     } catch (err) {
         console.error('[HOT RELOAD ERROR]', err);
@@ -102,4 +115,16 @@ let cleanupApi = require('./api.js')(app, processes, serverState);
 app.listen(PORT, () => {
     console.log(`winB server listening on http://0.0.0.0:${PORT} (HMR enabled, v${SERVER_VERSION})`);
     if (rotation) console.log(`[LOG ROTATION] ${rotation}`);
+    // Host context sampler: starts with the server, one row per change plus one resource
+    // sample per interval. WINB_TRACK=off leaves it idle but answering. See sampler.js.
+    const status = sampler.start();
+    console.log(`[SAMPLER] ${status.enabled ? (status.supported ? 'enabled' : 'enabled (non-windows: resource samples only)') : 'disabled by WINB_TRACK'} :: sample ${status.sampleSec}s, titles ${status.titles ? 'on' : 'off'}${status.titles && !status.titlesPersist ? ' (live-only)' : ''}, history ${status.history ? status.historyDir : 'off'}`);
 });
+
+const shutdown = (signal) => {
+    console.log(`[SHUTDOWN] ${signal}: closing sampler`);
+    try { sampler.stop(); } catch (_) { /* best effort on the way out */ }
+    process.exit(0);
+};
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));

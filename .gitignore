@@ -14,5 +14,6 @@ Thumbs.db
 sessions.json
 jobs.json
 history/
+server-env.ps1
 *.bak
 node_modules/

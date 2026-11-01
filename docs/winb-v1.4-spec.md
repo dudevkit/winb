@@ -1,7 +1,11 @@
 # winB v1.4 - host context and event timeline (SPEC)
 
-Status: **draft for review** - not implemented yet.
-Base: v1.3 (`feat/v1.3-hardening-typed-ops`). Target: v1.4, branch `feat/v1.4-context-state`.
+Status: **implemented** as server `1.4.0` (branch `feat/v1.4-context-state`). Acceptance on a live
+Windows host: `tests/verify_phase4.py` 18/18, `tests/smoke_local.sh` 35/35.
+Base: v1.3 (`feat/v1.3-hardening-typed-ops`).
+
+Sections marked *as built* record where the implementation diverged from the draft, including the
+two defects found while deploying it.
 
 ## 1. Problem
 
@@ -36,7 +40,8 @@ problems only by (a) a call failing, or (b) the owner mentioning it. It cannot a
 
 | Source | Yields | Cost | Notes |
 |---|---|---|---|
-| `Get-Process` snapshot | running processes, CPU seconds, working set | **6-11 ms** (386 procs) | cheapest useful signal |
+| `Get-Process` snapshot | running processes, working set | **24-31 ms** (373 procs) | cheapest useful signal |
+| `.CPU` per process | CPU seconds | **1732 ms for every process**, ~100 ms for the top 25 | perf-counter lookup per process: only read for candidates |
 | `Get-Process \| MainWindowTitle` | apps with a real window | ~10 ms | app-level, title included |
 | `GetForegroundWindow` + `GetWindowText` (P/Invoke) | the window actually in front | 9 ms after a 56 ms one-time `Add-Type` | the basis of usage duration |
 | UserAssist registry (`HKCU\...\Explorer\UserAssist`) | per-app run count + **last used timestamp** | 272 ms for 227 entries | retroactive: history predates the feature |
@@ -49,6 +54,12 @@ problems only by (a) a call failing, or (b) the owner mentioning it. It cannot a
 
 Full context assembly measured at **292-454 ms**. A single sampled line is **219 bytes**
 (1440 lines/day = 308 KB/day, ~2.1 MB/week).
+
+*As built*: reading `.CPU` for all processes dominated the tick (1.9 s of a 2.0 s tick), so the CPU
+list is built from the 25 largest processes by working set and only those get a CPU reading. Cost
+per tick in the persistent helper: **first tick ~740 ms (Add-Type compile), then 300-320 ms**;
+the transient fallback path costs ~750 ms per call. Trade-off, stated plainly: a CPU-heavy process
+with a tiny footprint can be missed by the leaderboard.
 
 ## 5. Tracking tiers
 
@@ -95,8 +106,12 @@ One JSON object per line, appended to `history/state-YYYYMMDD.jsonl` (newline-de
 | `reach.fail` | gateway-side probe failed N times | `target`, `streak` |
 
 Sampling is **sparse**: a line is written on change (app switch, network transition, boot) plus a
-`res.sample` every 60 s. Usage duration is derived at query time by diffing switch events - no
-per-second rows.
+`res.sample` every 60 s.
+
+*As built*: usage duration is stored, not re-derived. When a foreground segment closes (app change,
+sampler stop, tracking switched off) the sampler writes an `app.usage` row with the elapsed seconds,
+so `GET /apps` is a plain sum. The segment that is still open is added at query time from live
+state, which is why an app can report minutes before its first closed segment exists.
 
 ## 7. Endpoints
 
@@ -165,6 +180,10 @@ the spec only fixes the poll shape.
 3. **Titles are not persisted by default** (RAM ring only, `WINB_TITLES_PERSIST=1` to opt in).
 4. **History directory is ACL-restricted** to the account running the server; `history/` is in
    `.gitignore`; the purge endpoint exists so deletion is a one-liner.
+   *As built*: the disk copy loses every `title` key recursively, empty strings included - the first
+   implementation only dropped truthy titles, so a window with no caption still put `"title":""`
+   into the timeline. `tests/verify_phase4.py` check 13 fails if any `title` reaches the disk while
+   persistence is off.
 5. **Kill switches**: `WINB_TRACK=off` (per-tick), `WINB_HISTORY=0` (stop writing, keep serving),
    `WINB_TITLES=off` (tier 1 only). All take effect without a restart.
 6. **No telemetry, no upload, no third party.** Data is served only to callers holding the token.
@@ -176,6 +195,20 @@ the spec only fixes the poll shape.
 9. **Stated limits**: the sampler sees the interactive session the server runs in - other sessions,
    fast user switching, and RDP sessions are invisible (good for privacy, a known context gap).
    Elevated processes may refuse title reads. The Security log needs elevation and is out of scope.
+
+## 11a. Launcher and deployment settings (*as built*)
+
+The watchdog is the process that respawns node, so both launchers must see the same settings:
+
+- `winb-tray.ps1` and `watchdog.ps1` dot-source **`server-env.ps1`** (next to `server.js`, optional,
+  gitignored) before spawning node. A manual start and an automatic respawn then produce an
+  identical process. Template: `winb-server/server-env.example.ps1`.
+- The tray launches one watchdog (idempotent) and removes `watchdog.owner` on Exit; the watchdog
+  stops when the owner PID is gone.
+- **Never** restart the server by killing every `node.exe` on the machine, and never kill the tray
+  and the watchdog together without immediately starting a replacement: both were observed in
+  practice to take unrelated dev servers down with them, and the second leaves node unsupervised.
+  Replace the process holding the port and let the watchdog respawn it.
 
 ## 12. Configuration
 
@@ -198,21 +231,28 @@ the spec only fixes the poll shape.
 | Symptom | Behaviour |
 |---|---|
 | PowerShell helper dies | respawn; 3 failures -> transient spawns -> event-log only, flagged in `/state.tracking.degraded` |
+| Helper pipe is wedged | after 3 failed ticks the wedged child is killed so the next tick starts a fresh one (*as built*) |
+| A tick never returns | the next interval takes over after a stall window instead of the sampler going quiet forever (*as built*) |
+| Volume stalls, sync fs blocks the loop | observed on a real host: `appendFileSync` on a stalled volume blocks the event loop, so HTTP stops answering while the port stays open. Mitigation is outside the process: the watchdog's hang recovery below (*as built*) |
 | PowerShell unavailable/policy-blocked | fall back to event logs + disk + `quser`; app tracking reports `unavailable` |
 | No elevation | Security log absent (expected, documented); everything else works |
 | History dir unwritable | log to `server.log`, keep serving from the live ring |
 | Clock/timezone oddity | events carry the host offset; cursor comparisons are monotonic on byte offset, not wall clock |
 | Host unreachable | nothing to read; the watcher reports `net.down` |
+| Health fails while the port is still held | after 4 consecutive strikes the watchdog kills the node process holding the port and respawns it; a foreign process holding the port is reported, never killed (*as built*) |
 
 ## 14. Tests
 
 Extend `tests/smoke_local.sh` (OS-agnostic surface) and add a phase-4 live suite:
 
-- `/state` shape, `/timeline` ordering + `kinds` filter, `/events/since` cursor advances and does not
-  replay, `/apps` rollup arithmetic (switch events -> durations), `/history/purge` deletes only
-  beyond N days, private endpoints 401 without a token even on loopback, `/manifest.tracking`
-  reflects env changes, `WINB_TRACK=off` stops new rows within one tick, `WINB_TITLES=off` yields
-  `app` without `title`, history rotation honours `WINB_HISTORY_MAX_MB`.
+Live suite `tests/verify_phase4.py` (18 checks) covers: private endpoints 401 without a token even
+on loopback, manifest caps + tracking block, sampler health, the `/state` contract (host, power,
+session, disks, network, resources, foreground app, live titles), helper path versus degraded path,
+`/timeline` content and ordering, the `kinds` filter, titles absent from disk while persistence is
+off, `/apps` rollup, `/events/since` baseline and no-replay, retention accounting, and latency.
+
+`tests/smoke_local.sh` (35 checks, no Windows needed) covers the same endpoints on a POSIX host,
+where the sampler degrades to node-level resource samples.
 
 ## 15. Rollout
 
