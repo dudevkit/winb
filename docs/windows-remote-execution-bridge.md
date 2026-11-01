@@ -82,7 +82,7 @@ winb [OPTIONS] "command"
 ```
 
 **Options:**
-- `-w, --workdir <dir>`: Working directory on the Windows PC (e.g. "F:\AliceWorkspace"). If omitted, uses the winb-server directory.
+- `-w, --workdir <dir>`: Working directory on the Windows PC (e.g. `F:\AliceWorkspace`). If omitted, the server uses its default working directory (`WINB_DEFAULT_CWD`, else a `winb-scratch` folder under the system temp area). Pass `-w` for anything that must not land in the scratch dir.
 - `-b, --background`: Run command in background (returns immediately). Crucial for dev servers (`npm start`, `python app.py`).
 - `-id, --process-id <id>`: Custom process ID for background task (optional, pairs with -b).
 - `-k, --kill <id>`: Kill a background process by ID.
