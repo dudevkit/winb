@@ -208,17 +208,28 @@ else {
 }
 
 Section "10. Reachability self-test"
-& ssh -N -i $keyDst -R "127.0.0.1:15110:127.0.0.1:$port" `
-  -o ExitOnForwardFailure=yes -o ConnectTimeout=20 -o BatchMode=yes `
-  -o StrictHostKeyChecking=accept-new ubuntu@43.156.65.16 -f
-Start-Sleep -Seconds 4
-if (Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -and $_.CommandLine -match "15110" }) {
-  Write-Output "tunnel accepted by the bastion - the gateway can now drive this PC"
-  Write-Output "NOTE: this extra test tunnel is temporary; the tray keeps a permanent one."
+# On a fresh install nothing holds the bastion port yet, so a probe tunnel is the only way
+# to learn whether the key is trusted. On an upgrade the tray keeper is already connected,
+# and a second -R to the same port dies with ExitOnForwardFailure - the port being taken is
+# proof the tunnel works, not a failure. Report that instead of a misleading "accepted".
+$existing = Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -and $_.CommandLine -match "15110" }
+if ($existing) {
+  Write-Output ("tunnel already established by the keeper (ssh pid " + (($existing | Select-Object -ExpandProperty ProcessId) -join ',') + ") - self-test skipped")
 } else {
-  Write-Output "tunnel refused. Either outbound TCP 22 is blocked by the corporate network,"
-  Write-Output "or the key above is not trusted on the bastion yet. Send Alice the key line."
+  & ssh -N -i $keyDst -R "127.0.0.1:15110:127.0.0.1:$port" `
+    -o ExitOnForwardFailure=yes -o ConnectTimeout=20 -o BatchMode=yes `
+    -o StrictHostKeyChecking=accept-new ubuntu@43.156.65.16 -f
+  Start-Sleep -Seconds 4
+  $test = Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match "15110" }
+  if ($test) {
+    Write-Output "tunnel accepted by the bastion - the gateway can now drive this PC"
+    Write-Output "NOTE: this extra test tunnel is temporary; the tray keeps a permanent one."
+  } else {
+    Write-Output "tunnel refused. Either outbound TCP 22 is blocked by the corporate network,"
+    Write-Output "or the key above is not trusted on the bastion yet. Send Alice the key line."
+  }
 }
 
 Write-Output ""
