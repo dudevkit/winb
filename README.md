@@ -116,6 +116,8 @@ Left unset, the CLI talks to `http://127.0.0.1:5110` — the tunnel/port-forward
 | Variable | Side | Purpose |
 |---|---|---|
 | `WINB_PORT` | server | listen port (default 5110) |
+| `WINB_BIND` | server | listen interface (default `0.0.0.0`; use `127.0.0.1` for a tunnel-only box) |
+| `WINB_VERSION_SUFFIX` | server | label appended to the version in `/health`, e.g. `-office` (default empty) |
 | `WINB_TOKEN`, `WINB_TOKEN_FILE` | server | bearer token (default `.token` next to `server.js`) |
 | `WINB_DEFAULT_CWD` | server | working directory when a call passes none |
 | `WINB_ALLOWED_ROOTS` | server | `;`-separated write roots |
