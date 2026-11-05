@@ -12,6 +12,14 @@
 # Listen port (default 5110)
 # $env:WINB_PORT = '5110'
 
+# Listen interface (default 0.0.0.0). Set '127.0.0.1' when the server is reached through
+# a tunnel or a local proxy only - nothing else should be able to talk to it.
+# $env:WINB_BIND = '127.0.0.1'
+
+# Label appended to the version reported by /health, so two machines running the same
+# build stay distinguishable in logs (e.g. '-office').
+# $env:WINB_VERSION_SUFFIX = '-office'
+
 # Bearer token for non-loopback callers. Prefer the .token file next to server.js; set this
 # only when a service wrapper has to supply the token from the environment.
 # Describe the value, never commit it: a 64 character hex string.

@@ -7,8 +7,15 @@ const app = express();
 // which is what lets GET /reload swap api.js without leaking sampler children or timers.
 const sampler = require('./sampler.js');
 const PORT = Number(process.env.WINB_PORT || 5110);
+// Bind interface. Loopback-only is the right default for a deployment that is reached
+// through a tunnel: nothing on the surrounding LAN has any business talking to an
+// unauthenticated bridge. Kept configurable so an existing 0.0.0.0 install keeps working.
+const BIND_HOST = process.env.WINB_BIND || '0.0.0.0';
 const startedAt = new Date();
-const SERVER_VERSION = '1.4.0';
+// Deployment label: two machines can run this same build (home PC, office PC kit) and
+// /health has to tell them apart. Empty by default, so an unmodified checkout reports
+// the bare version.
+const SERVER_VERSION = '1.4.0' + (process.env.WINB_VERSION_SUFFIX || '').trim();
 const BODY_LIMIT_MB = Number(process.env.WINB_BODY_LIMIT_MB || 64);
 const TOKEN_FILE = process.env.WINB_TOKEN_FILE || path.join(__dirname, '.token');
 const LOG_FILE = path.join(__dirname, 'server.log');
@@ -82,6 +89,7 @@ const serverState = {
     startedAt,
     version: SERVER_VERSION,
     port: PORT,
+    bindHost: BIND_HOST,
     hmr: true,
     workdir: process.env.WINB_DEFAULT_CWD || path.join(os.tmpdir(), 'winb-scratch'),
     platform: process.platform,
@@ -112,8 +120,8 @@ app.get('/reload', (req, res) => {
 // Initialize dynamic API routes
 let cleanupApi = require('./api.js')(app, processes, serverState);
 
-app.listen(PORT, () => {
-    console.log(`winB server listening on http://0.0.0.0:${PORT} (HMR enabled, v${SERVER_VERSION})`);
+app.listen(PORT, BIND_HOST, () => {
+    console.log(`winB server listening on http://${BIND_HOST}:${PORT} (HMR enabled, v${SERVER_VERSION})`);
     if (rotation) console.log(`[LOG ROTATION] ${rotation}`);
     // Host context sampler: starts with the server, one row per change plus one resource
     // sample per interval. WINB_TRACK=off leaves it idle but answering. See sampler.js.

@@ -16,6 +16,9 @@ jobs.json
 history/
 server-env.ps1
 *.bak
+
+# office kit build output (office-pc/build-office-kit.sh)
+dist/
 node_modules/
 __pycache__/
 *.pyc
